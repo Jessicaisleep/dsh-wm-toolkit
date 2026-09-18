@@ -51,43 +51,76 @@ npm pack --dry-run
 
 ## 3. 发布
 
-### 3.1 准备账号（一次性）
+发布走 **GitHub Actions + npm Trusted Publishing（OIDC）**：不需要任何 token、不会过期、自带 provenance 签名。
+工作流见 `.github/workflows/publish.yml`；`0.1.0` 是首个版本（用一次性 token 手工发布），之后都用 CI。
 
-1. 浏览器打开 https://www.npmjs.com/ 注册账号（免费）。用户名建议与 GitHub 一致。
-2. 登录排障：本机 **没有** `node`/`npm`，但有 `pnpm`（DSH 自带），发布走 `pnpm publish`。
-   二选一登录：
-   - `pnpm login`（输入用户名 / 密码 / 邮箱 OTP）；或
-   - 更稳：npmjs.com → Account → **Access Tokens** → Generate New Token
-     （Classic + 勾 **Bypass 2FA**，或 Automation 类型），把 token 写进 `C:\Users\<你>\.npmrc`：
+### 3.1 一次性配置：npm 侧绑定本仓库
 
-     ```
-     //registry.npmjs.org/:_authToken=npm_xxxxxxxxxxxxxxxx
-     ```
+在包页面配置 Trusted Publisher（必须先存在该包 —— `0.1.0` 已发布 ✔）：
 
-### 3.2 发布
+1. 打开 https://www.npmjs.com/package/dsh-wm-toolkit/access
+   （或：包页面 → **Settings** 标签 → **Trusted Publisher**）
+2. **Select your publisher** 选 **GitHub Actions**
+3. 按下面填写（大小写与文件名必须完全一致）：
+
+   | 字段 | 值 |
+   |---|---|
+   | Organization or user | `Jessicaisleep` |
+   | Repository | `dsh-wm-toolkit` |
+   | Workflow filename | `publish.yml` |
+   | Environment name | （留空） |
+   | Allowed actions | `npm publish` |
+
+4. 保存（按钮字样为 **Set up connection** / **Add**）。
+5. 私有仓库无法生成 provenance，那种情况下去掉工作流里的 `--provenance`。
+
+配好之后本机的 token 就不需要了：删掉 `C:\Users\<你>\.npmrc` 里那一行（旧 token 已在 npm 侧 Delete）。
+
+### 3.2 发新版（打 tag 即发）
 
 ```powershell
 cd "D:\DSH工作区\DSH插件\dsh-wm-toolkit"
 
-# 预演（不真的发；已验证可用）
-pnpm publish --dry-run --ignore-scripts
+# 1) 改代码 / 升版本：package.json 的 version 与 CHANGELOG.md
+# 2) 本地构建自检（本机没有 node，用 DSH 自带的 Node）
+$env:ELECTRON_RUN_AS_NODE='1'
+& "D:\Program Files (x86)\DSH Desktop\DSH Desktop.exe" build.mjs
+& "D:\Program Files (x86)\DSH Desktop\DSH Desktop.exe" tests\run-all.mjs
 
-# 正式发布
-pnpm publish --ignore-scripts
+# 3) 提交并推送
+git add -A; git commit -m "release: 0.1.1"; git push
+
+# 4) 打 tag 触发发布（tag 必须与 package.json 版本一致，工作流会强制校验）
+git tag v0.1.1; git push origin v0.1.1
 ```
 
-- `--ignore-scripts` 的原因：本机 PATH 里没有 `node`，而包内 `prepublishOnly: node build.mjs` 跑不起来；
-  发布前请**先在源码目录用 DSH 自带的 Node 跑一次 `build.mjs`**（见第 1 节），
-  或用 `npm publish --ignore-scripts` 前先手动构建。装了 Node 的机器可直接 `pnpm publish`。
-- 包名 `dsh-wm-toolkit` **不带作用域**，首次发布默认就是 public，**不需要** `--access public`
-  （那是 scoped 包才要求的）。
-- 若网络需要代理才能访问 npm：`pnpm config set proxy http://<host>:<port>`（https-proxy 同理）。
+也可以在 GitHub → **Actions** → “Publish to npm” → **Run workflow** 手动触发（手动触发不做 tag 校验，直接用 package.json 里的版本）。
 
-### 3.3 发布后验证
+工作流做的事：升级 npm CLI → 校验 tag/版本 → `node build.mjs` → `node tests/run-all.mjs` → `npm publish --provenance --access public`。
+
+### 3.3 应急/本地发布（不用 CI 时）
+
+本机 **没有** `node`/`npm`，但有 `pnpm`：
+
+```powershell
+# 一次性：拿到能发布的凭证（推荐 www.npmjs.com → Access Tokens → Granular，
+#   Packages and scopes → Permissions = Read and write (publish and stage)，勾 Bypass 2FA）
+# 然后写进用户级 .npmrc（注意 token 要写在同一行）：
+pnpm config set "//registry.npmjs.org/:_authToken" "npm_xxxxxxxx" --location=user
+pnpm whoami                      # 应输出 jessicaisleep
+
+pnpm publish --dry-run --ignore-scripts   # 预演
+pnpm publish --ignore-scripts             # 正式发布（跳过 prepublishOnly，因为本机无 node）
+```
+
+- 包名 `dsh-wm-toolkit` **不带作用域**，发布默认 public，**不需要** `--access public`（scoped 包才要）。
+- 网络需要代理时：`pnpm config set proxy http://<host>:<port>`（`https-proxy` 同理）。
+
+### 3.4 发布后验证
 
 ```bash
 dsh plugin --profile desktop add dsh-wm-toolkit
-# 重启 DSH → 插件列表应只多一行
+# 重启 DSH → 插件列表应只多一行；$DSH_HOME\dsh-wm-toolkit.log 应有两条「半边已应用」
 ```
 
 ## 4. 版本与文档
