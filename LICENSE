@@ -1,14 +1,6 @@
 MIT License
 
-Copyright (c) 2026 dsh-wm-toolkit contributors
-
-This package composes two independently maintained halves, both derived from
-MIT-licensed upstream projects (see NOTICE.md for the full attribution):
-
-  · parts/recall   — derived from dsh-message-recall 2.6.1 (MIT)
-  · parts/manager  — derived from dsh-session-manager 0.4.11 (MIT),
-                     whose original notice reads
-                     "Copyright (c) 2026 dsh-session-manager contributors"
+Copyright (c) 2026 Jessicaisleep
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
