@@ -1,0 +1,64 @@
+# 用 npm Trusted Publishing 发布（OIDC，无需任何 token）
+#
+# 触发方式：推送 v* tag（如 v0.1.1），或在 GitHub 上手动 Run workflow。
+#
+# 前置条件（一次性，在 npm 网站上配置）：
+#   包页面 → Settings → Trusted Publisher → GitHub Actions
+#     Organization or user : Jessicaisleep
+#     Repository           : dsh-wm-toolkit
+#     Workflow filename    : publish.yml
+#     Environment name     : （留空）
+#     Allowed actions      : npm publish
+#
+# 说明：
+#   - id-token: write 是 Trusted Publishing 的前提（用 OIDC 换一次性发布凭证），
+#     所以本工作流**不配置 NODE_AUTH_TOKEN / 不需要任何 secret**。
+#   - 发布前会强制校验 tag 与 package.json 版本一致，避免"发了已存在的版本"这种失败。
+#   - 若仓库是私有仓库，去掉 --provenance（私有仓库不能生成 provenance）。
+
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted Publishing 需要较新的 npm CLI（OIDC 支持）
+      - name: 升级 npm CLI
+        run: npm install -g npm@latest
+
+      - name: 校验 tag 与 package.json 版本一致
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          PKG=$(node -p "require('./package.json').version")
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "package.json=$PKG  tag=$TAG"
+          if [ "$PKG" != "$TAG" ]; then
+            echo "::error::tag v$TAG 与 package.json 版本 $PKG 不一致，先改版本再打 tag"
+            exit 1
+          fi
+
+      - name: 构建（由 parts/ 生成 lib/）
+        run: node build.mjs
+
+      - name: 测试（两半离线测试）
+        run: node tests/run-all.mjs
+
+      - name: 发布
+        run: npm publish --provenance --access public
