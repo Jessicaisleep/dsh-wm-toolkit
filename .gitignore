@@ -1,0 +1,13 @@
+# 依赖与产物
+node_modules/
+*.tgz
+*.log
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 构建产物里的临时文件（lib/ 是生成物，但要入库，因为用户装包直接用）
+lib/*.tmp

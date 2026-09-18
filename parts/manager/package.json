@@ -1,0 +1,55 @@
+{
+    "name":  "dsh-session-manager-wm",
+    "version":  "0.4.11+wm.1",
+    "description":  "[fork of dsh-session-manager 0.4.11, renamed so upstream updates cannot overwrite it] 在 DSH 中管理会话（删除/归档/跨工作区移动/预设迁移），并新增“工作区文件夹迁移”：文件夹搬家或改名后，一键修复工作区记录、每条会话的 cwd 与日志物理位置。",
+    "license":  "MIT",
+    "keywords":  [
+                     "dsh",
+                     "deepseek-harness",
+                     "plugin",
+                     "session",
+                     "archive",
+                     "move",
+                     "workspace",
+                     "preset",
+                     "migration"
+                 ],
+    "repository":  {
+                       "type":  "git",
+                       "url":  "git+https://github.com/hkkz9522/dsh-session-manager.git"
+                   },
+    "bugs":  {
+                 "url":  "https://github.com/hkkz9522/dsh-session-manager/issues"
+             },
+    "homepage":  "https://github.com/hkkz9522/dsh-session-manager",
+    "type":  "module",
+    "main":  "./lib/index.js",
+    "exports":  {
+                    ".":  "./lib/index.js",
+                    "./client":  "./lib/client.js",
+                    "./package.json":  "./package.json"
+                },
+    "files":  [
+                  "lib",
+                  "cordis.patch.yml",
+                  "LICENSE",
+                  "README.md",
+                  "README.zh.md",
+                  "CHANGELOG.md",
+                  "scripts/heal-v2-sessions.ps1"
+              ],
+    "dsh":  {
+                "bundle":  {
+                               "patch":  "./cordis.patch.yml"
+                           },
+                "client":  {
+                               "inject":  [
+                                              "@deepseek-ai/dsh-client-ui-slots"
+                                          ],
+                               "platform":  "web"
+                           }
+            },
+    "peerDependencies":  {
+                             "cordis":  "\u003e=4.0.0-rc \u003c5"
+                         }
+}

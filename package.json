@@ -1,0 +1,75 @@
+{
+  "name": "dsh-wm-toolkit",
+  "version": "0.1.0",
+  "description": "撤回、编辑指令与回复（连思考过程一起改）、用原提问重新生成、会话归档/删除/跨工作区移动与工作区迁移。 Recall, edit prompts and replies (reasoning included), regenerate with the original prompt, session archive/delete, cross-workspace move, and workspace migration.",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "parts",
+    "build.mjs",
+    "cordis.patch.yml",
+    "LICENSE",
+    "NOTICE.md",
+    "README.md",
+    "CHANGELOG.md",
+    "RELEASE.md"
+  ],
+  "dsh": {
+    "displayName": "WM 工具集",
+    "displayDescription": "消息可改 + 会话/工作区可管（一个插件）",
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "slots",
+        "sessions",
+        "workspaces",
+        "conversation",
+        "modelDirectories"
+      ],
+      "platform": "web"
+    }
+  },
+  "engines": {
+    "dsh": ">=0.1.5-rc.1"
+  },
+    "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Jessicaisleep/dsh-wm-toolkit.git"
+  },
+  "homepage": "https://github.com/Jessicaisleep/dsh-wm-toolkit#readme",
+  "bugs": {
+    "url": "https://github.com/Jessicaisleep/dsh-wm-toolkit/issues"
+  },
+  "author": "Jessicaisleep <2603554381@qq.com> (https://github.com/Jessicaisleep)",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node tests/run-all.mjs",
+    "prepublishOnly": "node build.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "message-recall",
+    "message-edit",
+    "assistant-edit",
+    "regenerate",
+    "session-manager",
+    "workspace-migration",
+    "撤回",
+    "重编辑",
+    "重新生成",
+    "会话管理",
+    "工作区迁移"
+  ]
+}

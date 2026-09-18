@@ -1,0 +1,7 @@
+# 统一换行，避免 Windows 上反复出现 LF/CRLF 噪声提交
+* text=auto eol=lf
+
+# 二进制/生成物不需要 diff
+*.tgz binary
+lib/client.js -diff
+lib/index.js -diff

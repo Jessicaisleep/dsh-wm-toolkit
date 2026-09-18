@@ -1,0 +1,5 @@
+# dsh-wm-toolkit bundle patch layer —— 把本插件挂载进 profile 树。
+# 一个插件 id 承载全部功能；两个半边（parts/recall、parts/manager）由 lib/index.js + lib/client.js 组合。
+- insert:
+    - id: dsh-wm-toolkit
+      name: dsh-wm-toolkit
