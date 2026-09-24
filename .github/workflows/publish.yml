@@ -72,6 +72,15 @@ jobs:
         run: |
           set +e
           LOG="$RUNNER_TEMP/npm-publish.log"
+          VERSION=$(node -p "require('./package.json').version")
+          # 幂等：该版本已发布过就跳过。
+          # 重跑同一个 tag（或 workflow_dispatch 回放一次成功发布）时，npm 会以
+          # "You cannot publish over the previously published versions: X" 失败 ——
+          # 那会让一次**无害的重跑**显示成红色失败，掩盖真正的故障。
+          if npm view "dsh-wm-toolkit@$VERSION" version >/dev/null 2>&1; then
+            echo "::notice::dsh-wm-toolkit@$VERSION 已经发布过，跳过发布（幂等）"
+            exit 0
+          fi
           npm publish --provenance --access public > "$LOG" 2>&1
           CODE=$?
           echo "===== npm publish exit code: $CODE ====="
