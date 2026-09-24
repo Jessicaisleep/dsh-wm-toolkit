@@ -43,6 +43,10 @@ jobs:
       - name: 升级 npm CLI
         run: npm install -g npm@latest
 
+      - name: 环境诊断（写进 annotation，便于没有浏览器时排查）
+        run: |
+          echo "::notice::node=$(node -v) | npm=$(npm -v) | registry=$(npm config get registry)"
+
       - name: 校验 tag 与 package.json 版本一致
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -60,5 +64,23 @@ jobs:
       - name: 测试（两半离线测试）
         run: node tests/run-all.mjs
 
+      # 发布。输出同时落盘、回显，并把关键行写成 annotation ——
+      # annotation 是公开可读的（`GET /repos/{owner}/{repo}/check-runs/{id}/annotations`），
+      # 所以即使手上没有能打开 github.com 的浏览器，也能用 API 把失败原因取出来。
+      # 之前 `npm publish` 出现过 exit 0 却什么都没发的情况，所以额外做一次 registry 复查。
       - name: 发布
-        run: npm publish --provenance --access public
+        run: |
+          set +e
+          LOG="$RUNNER_TEMP/npm-publish.log"
+          npm publish --provenance --access public > "$LOG" 2>&1
+          CODE=$?
+          echo "===== npm publish exit code: $CODE ====="
+          cat "$LOG"
+          echo "===== registry 复查（publish 之后实际能查到的版本）====="
+          sleep 5
+          npm view dsh-wm-toolkit version 2>&1 | head -3
+          echo "::warning::npm publish exit=$CODE；步骤名=发布"
+          grep -Ei 'publish|stag|error|warn|notice|registry|auth|provenance' "$LOG" | head -n 8 | while IFS= read -r line; do
+            echo "::warning::npm-publish: $line"
+          done
+          exit $CODE
