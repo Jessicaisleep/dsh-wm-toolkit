@@ -1,13 +1,13 @@
 /**
- * build.mjs — 把 parts/ 下的两个"半边"组合成**一个插件**的产物。
+ * build.mjs — 把 parts/ 下的各个"半边"组合成**一个插件**的产物。
  *
  * 产物：
- *   lib/index.js   —— 宿主半边：导入两半的 apply 并依次调用（各自独立，互不牵连）
- *   lib/client.js  —— 浏览器半边：**一次** __ModuleLoader__.load()，工厂内部把两半各自
+ *   lib/index.js   —— 宿主半边：导入各半边的 apply 并依次调用（各自独立，互不牵连）
+ *   lib/client.js  —— 浏览器半边：**一次** __ModuleLoader__.load()，工厂内部把各半边各自
  *                     包进一个 IIFE（保持各自的变量作用域，避免同名冲突）
  *
- * 为什么不直接合并源码：两半各自有几百个顶层标识符（log / TEXT / apply …），
- * 手写合并极易撞名。这里只做"搬运 + 包裹"，两半的代码**逐字节不变**，
+ * 为什么不直接合并源码：半边各自有几百个顶层标识符（log / TEXT / apply …），
+ * 手写合并极易撞名。这里只做"搬运 + 包裹"，半边的代码**逐字节不变**，
  * 以后要改就改 parts/ 下的文件，然后重跑本脚本。
  *
  * 用法：node build.mjs（或先设 ELECTRON_RUN_AS_NODE=1 用 DSH 自带 Node 跑）
@@ -24,6 +24,7 @@ const PKG = 'dsh-wm-toolkit';
 const HALVES = [
   { key: 'recall', dir: join(here, 'parts', 'recall'), label: '消息撤回/编辑（含编辑我的回复、↻ 重新生成）' },
   { key: 'manager', dir: join(here, 'parts', 'manager'), label: '会话/工作区管理（含工作区真迁移）' },
+  { key: 'delete', dir: join(here, 'parts', 'delete'), label: '消息删除（按条删指令/回复、按步骤删思考与工具调用）' },
 ];
 
 // ---------------------------------------------------------------- 宿主半边
@@ -31,11 +32,11 @@ const HALVES = [
 const hostSource = `/**
  * ${PKG} — 宿主半边（**生成物**：改 parts/ 后运行 node build.mjs，勿直接编辑本文件）。
  *
- * 组合方式：导入两半的模块，依次调用它们的 apply(ctx)。任何一半抛错都只记日志、
- * 不影响另一半（只有两半都失败才抛出，让 DSH 明确报错而不是静默半死）。
+ * 组合方式：导入各半边的模块，依次调用它们的 apply(ctx)。任何一半抛错都只记日志、
+ * 不影响另一半（只有全部半边都失败才抛出，让 DSH 明确报错而不是静默半死）。
  *
- * 两半的模块标识符（inject）取并集：召回侧需要 settings/storageDomain/agentPresets 等，
- * 管理侧需要 workspaceRegistry/agents/sessionPersistence 等。
+ * 各半边的模块标识符（inject）取并集：召回侧需要 settings/storageDomain/agentPresets 等，
+ * 管理侧需要 workspaceRegistry/agents/sessionPersistence 等，删除侧只需要 webServer。
  */
 import { appendFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -43,12 +44,14 @@ import { join as joinPath } from 'node:path';
 
 import * as recallHalf from '../parts/recall/lib/index.js';
 import * as managerHalf from '../parts/manager/lib/index.js';
+import * as deleteHalf from '../parts/delete/lib/index.js';
 
 export const name = '${PKG}';
 
 const HALVES = [
   ['recall', recallHalf],
   ['manager', managerHalf],
+  ['delete', deleteHalf],
 ];
 
 export const inject = Array.from(new Set(
@@ -83,7 +86,7 @@ export function apply(ctx) {
     }
   }
   if (failures.length === HALVES.length) {
-    throw new Error('${PKG}: 两个半边都未能加载 — ' + failures.join(' | '));
+    throw new Error('${PKG}: 全部半边都未能加载 — ' + failures.join(' | '));
   }
   if (failures.length > 0) logLine('部分半边未加载（其余功能正常）', { failures });
 }
@@ -98,10 +101,15 @@ function factoryBodyOf(source, label) {
   const braceStart = source.indexOf('{', marker);
   if (braceStart < 0) throw new Error(`${label}: 找不到工厂起始大括号`);
   // 文件尾部形如 `  }\n});`（LF 或 CRLF）：`});` 之前那个 `}` 就是工厂的收尾大括号。
+  // 工厂后面跟一个尾逗号（`  },\n});`）也接受——上游 bundle 两种写法都有。
   const loadTail = source.lastIndexOf('});');
   if (loadTail < 0) throw new Error(`${label}: 找不到 load() 收尾`);
   let i = loadTail - 1;
   while (i > braceStart && /\s/.test(source[i])) i -= 1;
+  if (source[i] === ',') {
+    i -= 1;
+    while (i > braceStart && /\s/.test(source[i])) i -= 1;
+  }
   if (source[i] !== '}') throw new Error(`${label}: 工厂收尾大括号定位失败`);
   const body = source.slice(braceStart + 1, i);
   if (!body.includes('apply')) throw new Error(`${label}: 工厂体里看不到 apply`);
@@ -118,8 +126,8 @@ const halves = HALVES.map(({ key, dir, label }) => {
 const clientSource = `/**
  * ${PKG} — 浏览器半边（**生成物**：改 parts/ 后运行 node build.mjs，勿直接编辑本文件）。
  *
- * 一次 load()，工厂内部把两半各自包进 IIFE 后取它们的插件面（{name, inject, apply}）：
- * 两半保持各自的变量作用域，不需要改动任何一行原有代码，也不会撞名。
+ * 一次 load()，工厂内部把各半边各自包进 IIFE 后取它们的插件面（{name, inject, apply}）：
+ * 半边保持各自的变量作用域，不需要改动任何一行原有代码，也不会撞名。
  * 应用时的隔离与宿主半边一致：一半抛错只影响那一半。
  */
 window.__ModuleLoader__.load({

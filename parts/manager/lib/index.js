@@ -32,7 +32,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { createDshAdapter } from "./compat/dsh-adapter.js";
 import { decompressAllZstdFrames } from "./compat/zstd-frames.js";
 import { applyWorkspaceMenuPatch } from "./workspace-menu-patch.js";
-import { deleteSessionFiles, listSessions, projectKey, readHeader, relocateSessions } from "./wm-relocate.js";
+import { deleteSessionFiles, listSessions, projectKey, purgeOrphanProjcache, readHeader, reconcileProjcacheForSession, reconcileProjcacheIdentity, relocateSessions } from "./wm-relocate.js";
 
 export const name = "dsh-session-manager-wm";
 
@@ -573,10 +573,19 @@ ${rest}`, "utf8");
         };
       });
 
-      const cache = ctx.get("sessionProjectionCache");
-      if (cache !== void 0 && typeof cache.coldSnapshot === "function") {
-        try { await cache.coldSnapshot(sessionId); }
-        catch (error) { ctx.logger.warn(`session-manager: post-move cache refresh failed for "${sessionId}": ${String(error)}`); }
+      // 移动后对账投影缓存 identity。
+      // （旧的 `cache.coldSnapshot(sessionId)` 调用签名是错的——真实签名要
+      //   `(meta, inheritedEventCount, events)`——所以它每次都抛错被下面 catch 吞掉，
+      //   等于从来没生效过。这里换成只读 header 的对账，轻量且确实有效。）
+      try {
+        const dshHomePathForMove = ctx.get("dshHomePath");
+        reconcileProjcacheForSession({
+          sessionsRoot: typeof dshHomePathForMove === "function" ? dshHomePathForMove("sessions") : undefined,
+          projcacheDir: typeof dshHomePathForMove === "function" ? dshHomePathForMove("storages", "session_projcache", "sessions") : undefined,
+          sessionId
+        });
+      } catch (error) {
+        ctx.logger.warn(`session-manager: post-move cache identity reconcile failed for "${sessionId}": ${String(error)}`);
       }
             // The agent is still live (no teardown). The session's in-memory
       // header was rewritten above and the workspace registry updated;
@@ -801,12 +810,17 @@ ${rest}`, "utf8");
         } catch { /* per-session best-effort */ }
       }
 
-      /* Re-fold the projection cache for every relocated session (titles). */
-      const projectionCache = ctx.get("sessionProjectionCache");
-      if (projectionCache !== void 0 && typeof projectionCache.coldSnapshot === "function") {
-        for (const id of relocation.moved) {
-          try { await projectionCache.coldSnapshot(id); } catch { /* best-effort */ }
-        }
+      /* 迁移后对账每个会话的投影缓存 identity。
+         旧的 `projectionCache.coldSnapshot(id)` 签名错误（真实签名要完整日志），
+         一直抛错被吞掉；换成只读 header 的对账。 */
+      let identityRepaired = 0;
+      for (const id of relocation.moved) {
+        try {
+          if (reconcileProjcacheForSession({ sessionsRoot, projcacheDir, sessionId: id })) identityRepaired += 1;
+        } catch { /* best-effort */ }
+      }
+      if (identityRepaired > 0) {
+        ctx.logger.info(`session-manager(wm): ${identityRepaired} 个会话的投影缓存 identity 已对账修正`);
       }
 
       ctx.logger.info(
@@ -1305,17 +1319,41 @@ ${rest}`, "utf8");
     await detachFromWorkspaces(sessionId);
     await unarchiveSession(sessionId);
 
-    // Physical artifact (session.jsonl / session.jsonl.zstd) + any extras.
-    const dir = await sessionDirOf(sessionId);
-    if (dir !== void 0) {
-      await rm(dir, { recursive: true, force: true });
+    // Physical artifact + **projection cache row**.
+    //
+    // ⚠️ 缓存行必须一起删：会话列表里的冷行就是从 `<projcacheDir>/<id>.json` 来的。
+    // 只删工件目录的话，列表会留下一行永远"打不开"（session/not-found 因为工件没了）、
+    // 归档不了、也删不掉的幽灵行——用户看到的就是"点了删除没反应"。
+    // deleteSessionFiles 两样都删，而且**缓存行的删除不依赖工件存在**：所以对一个
+    // "工件早就没了、只剩缓存行"的坏会话再点一次删除，这一次就能真正清干净。
+    const dshHomePath = ctx.get("dshHomePath");
+    const sessionsRoot = typeof dshHomePath === "function" ? dshHomePath("sessions") : undefined;
+    const projcacheDir = typeof dshHomePath === "function" ? dshHomePath("storages", "session_projcache", "sessions") : undefined;
+
+    const removedFiles = [];
+    if (typeof sessionsRoot === "string" && typeof projcacheDir === "string") {
+      try {
+        removedFiles.push(...deleteSessionFiles({ sessionsRoot, projcacheDir, sessionId }).removed);
+      } catch (error) {
+        ctx.logger.warn(`session-manager: delete "${sessionId}" 文件清理失败（已忽略）：${String(error)}`);
+      }
+    } else {
+      // dshHomePath 不可用时的兜底：至少把工件目录删掉（缓存行这时无从定位）。
+      const dir = await sessionDirOf(sessionId);
+      if (dir !== undefined) {
+        try {
+          await rm(dir, { recursive: true, force: true });
+          removedFiles.push(dir);
+        } catch { /* best-effort */ }
+      }
     }
 
     return {
       ok: true,
       sessionId,
       wasLive: session !== void 0 || agent !== void 0,
-      filesRemoved: dir !== void 0
+      filesRemoved: removedFiles.length > 0,
+      removed: removedFiles
     };
   };
 
@@ -1331,30 +1369,39 @@ ${rest}`, "utf8");
    * full re-read path.
    */
   ctx.effect(async () => {
-    const cache = ctx.get("sessionProjectionCache");
     const persistence = ctx.get("sessionPersistence");
     const registry = ctx.get("workspaceRegistry");
-    if (cache === void 0 || typeof cache.coldSnapshot !== "function") return;
     if (persistence === void 0 || typeof persistence.list !== "function") return;
     if (registry === void 0 || typeof registry.list !== "function") return;
     try {
-      // ---- step 1: re-fold every active session's projection cache row,
-      // so a session moved before coldSnapshot was wired in stops being
-      // identity-stuck under a stale {createdAt, cwd} key.
-      const headers = await listSessionHeaders(persistence, ctx.get("dshHomePath"));
-      let refolded = 0;
+      // ---- step 1: reconcile every active session's projection-cache identity,
+      // so a session moved before patchProjcache existed stops being
+      // identity-stuck under a stale {createdAt, cwd} key (that makes the cold
+      // list path fall back to basename(cwd) and surface the workspace title,
+      // for example "DSH", where the session's own title was expected).
+      //
+      // 0.2.4 起不再调 `sessionProjectionCache.coldSnapshot(id)`：那个 API 的真实签名是
+      // `coldSnapshot(meta, inheritedEventCount, events)`，要求调用方提供**完整日志**——
+      // 启动时对每个会话解压 MB 级 zstd 工件并不划算。旧代码只传了一个 id，于是每个会话都抛
+      // `SessionLogOffset must be a non-negative safe integer, got undefined`，`re-folded 0`。
+      // identity 对账足以达成这段 sweep 的目的，见 reconcileProjcacheIdentity 的注释。
+      const dshHomePath = ctx.get("dshHomePath");
+      const projcacheDir = typeof dshHomePath === "function" ? dshHomePath("storages", "session_projcache", "sessions") : undefined;
+      const headers = await listSessionHeaders(persistence, dshHomePath);
+      let reconciled = 0;
+      let repaired = 0;
       const headerById = new Map();
       for (const header of headers) {
         if (header === void 0 || header.cwd === void 0) continue;
         headerById.set(header.id, header);
         try {
-          await cache.coldSnapshot(header.id);
-          refolded += 1;
+          if (reconcileProjcacheIdentity({ projcacheDir, header })) repaired += 1;
+          reconciled += 1;
         } catch (error) {
-          ctx.logger.warn(`session-manager: post-boot cache refold failed for "${header.id}": ${String(error)}`);
+          ctx.logger.warn(`session-manager: post-boot cache identity reconcile failed for "${header.id}": ${String(error)}`);
         }
       }
-      ctx.logger.info(`session-manager: post-boot re-folded ${refolded} session projection cache rows`);
+      ctx.logger.info(`session-manager: post-boot reconciled ${reconciled} session projection cache rows（${repaired} 个 identity 已修正）`);
 
       // ---- step 2: reconcile workspace accounting with disk. After a few
       // pre-fix moves, a workspace record could keep a session id whose
@@ -1414,6 +1461,20 @@ ${rest}`, "utf8");
       }
       if (removed > 0 || added > 0) {
         ctx.logger.info(`session-manager: post-boot workspace reconcile removed ${removed} orphans, attached ${added} disk-only sessions`);
+      }
+
+      // ---- step 3: purge orphan projection-cache rows.
+      // 会话列表里的冷行 = `<projcacheDir>/<id>.json`。删会话时若没同步删缓存行
+      // （0.2.2 之前就是这样），界面会留下一行永远打不开（工件没了 → session/not-found）、
+      // 归档不了、也删不掉的幽灵行。判据与实现都在 purgeOrphanProjcache 里（可单测）。
+      const dshHomePathForCache = ctx.get("dshHomePath");
+      const sessionsRootForCache = typeof dshHomePathForCache === "function" ? dshHomePathForCache("sessions") : undefined;
+      const projcacheDirForCache = typeof dshHomePathForCache === "function"
+        ? dshHomePathForCache("storages", "session_projcache", "sessions")
+        : undefined;
+      const orphan = purgeOrphanProjcache({ sessionsRoot: sessionsRootForCache, projcacheDir: projcacheDirForCache });
+      if (orphan.purged.length > 0) {
+        ctx.logger.info(`session-manager: post-boot purged ${orphan.purged.length} orphan projection-cache rows（工件已不存在的幽灵会话行）`);
       }
     } catch (error) {
       ctx.logger.warn(`session-manager: post-boot reconcile failed: ${String(error)}`);

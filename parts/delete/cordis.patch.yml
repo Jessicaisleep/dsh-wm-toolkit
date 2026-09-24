@@ -1,0 +1,5 @@
+# dsh-wm-delete bundle patch layer —— 单独安装本半边时用它挂载。
+# 组合版（dsh-wm-toolkit）不用这个文件：根 cordis.patch.yml 已经挂了整个包。
+- insert:
+    - id: dsh-wm-delete
+      name: dsh-wm-delete

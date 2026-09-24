@@ -240,3 +240,121 @@ export function deleteSessionFiles(options) {
 	}
 	return { removed };
 }
+
+/**
+ * Reconcile one session's projection-cache identity with its stored header.
+ *
+ * 为什么需要：缓存行的 `record.identity` 是它与日志的绑定凭据。identity 一旦与当前
+ * header 不匹配，`sessionProjectionCache.recordFor()` 就返回 undefined，冷列表路径会退化成
+ * `basename(cwd)`，把工作区名（例如 "DSH"）当成会话标题显示出来。工作区搬家/改名之后
+ * 就会出现这个症状（`patchProjcache` 只覆盖迁移当场，历史遗留要靠这里兜）。
+ *
+ * 为什么**不**调 `coldSnapshot`：它的真实签名是
+ * `coldSnapshot(meta, inheritedEventCount, events)`——要求调用方提供**完整日志**，
+ * 插件在启动时对每个会话解压 MB 级 zstd 工件并不划算。而这段 sweep 的目的只是让
+ * identity 不过时，**修正 identity 就足以消除症状**。
+ *
+ * 只修能确定修正的四个字段；`inheritedEventCount` **原样保留**——工件 header 里没有它，
+ * 缓存行里的值才是唯一来源（它由 seed 长度决定，改 cwd 不影响它）。
+ *
+ * @param {{ projcacheDir: string, header: object }} options
+ * @returns {boolean} 是否真的改写了缓存行。
+ */
+export function reconcileProjcacheIdentity(options) {
+	const { projcacheDir, header } = options;
+	if (typeof projcacheDir !== 'string' || projcacheDir === '') return false;
+	if (header === null || typeof header !== 'object') return false;
+	if (typeof header.id !== 'string' || header.id === '') return false;
+	const file = join(projcacheDir, header.id + '.json');
+	if (!existsSync(file)) return false; // 没有缓存行 → 无需对账（首次冷读会创建）
+	let parsed;
+	try { parsed = JSON.parse(readFileSync(file, 'utf8')); } catch { return false; }
+	const identity = parsed?.record?.identity;
+	if (identity === null || typeof identity !== 'object') return false;
+	let changed = false;
+	if (typeof header.version === 'number' && identity.formatVersion !== header.version) {
+		identity.formatVersion = header.version;
+		changed = true;
+	}
+	if (typeof header.createdAt === 'number' && identity.createdAt !== header.createdAt) {
+		identity.createdAt = header.createdAt;
+		changed = true;
+	}
+	if (typeof header.cwd === 'string' && identity.cwd !== header.cwd) {
+		identity.cwd = header.cwd;
+		changed = true;
+	}
+	if (typeof header.isSeeded === 'boolean' && identity.isSeeded !== header.isSeeded) {
+		identity.isSeeded = header.isSeeded;
+		changed = true;
+	}
+	if (!changed) return false;
+	writeAtomic(file, JSON.stringify(parsed, null, 2) + '\n');
+	return true;
+}
+
+/**
+ * 按磁盘工件对账某个会话的投影缓存 identity（自己定位工件、读 header）。
+ *
+ * 移动/迁移之后调用。`patchProjcache` 只覆盖"当场改 cwd"这一种情形，这里兜住其余不一致
+ * （identity 的 createdAt / formatVersion / isSeeded 与工件对不上）。
+ *
+ * @param {{ sessionsRoot: string, projcacheDir: string, sessionId: string }} options
+ * @returns {boolean} 是否改写了缓存行。
+ */
+export function reconcileProjcacheForSession(options) {
+	const { sessionsRoot, projcacheDir, sessionId } = options;
+	if (typeof sessionsRoot !== 'string' || typeof projcacheDir !== 'string') return false;
+	if (typeof sessionId !== 'string' || sessionId === '') return false;
+	const entry = listSessions(sessionsRoot).find((item) => item.sessionId === sessionId);
+	if (entry === undefined) return false;
+	let header;
+	try {
+		const { line } = readHeader(readFileSync(join(entry.dir, LOG_NAME)));
+		header = JSON.parse(line);
+	} catch {
+		return false;
+	}
+	return reconcileProjcacheIdentity({ projcacheDir, header });
+}
+
+/**
+ * Purge projection-cache rows whose session artifact is gone from disk.
+ *
+ * 为什么必须清：会话列表里的**冷行**就是 `<projcacheDir>/<id>.json`。删会话时如果只删了
+ * 工件目录、漏了缓存行，界面上就会留下一行永远打不开（`session/not-found`，因为工件没了）、
+ * 归档不了、也删不掉的**幽灵行**。
+ *
+ * 判据刻意只用**纯磁盘扫描**（{@link listSessions}），不依赖任何持久化索引——索引本身可能
+ * 就带着已经删掉的 id。缓存行自带 `record.identity.cwd` 时再按它复算一次位置，磁盘上确实在
+ * 就跳过，避免因为目录布局差异误删真实会话。
+ *
+ * @param {{ sessionsRoot: string, projcacheDir: string }} options
+ * @returns {{ purged: string[] }} 被清掉缓存行的会话 id。
+ */
+export function purgeOrphanProjcache(options) {
+	const { sessionsRoot, projcacheDir } = options;
+	const purged = [];
+	if (typeof sessionsRoot !== 'string' || typeof projcacheDir !== 'string') return { purged };
+	if (!existsSync(projcacheDir)) return { purged };
+	const onDisk = new Set(listSessions(sessionsRoot).map((item) => item.sessionId));
+	let names;
+	try { names = readdirSync(projcacheDir); } catch { return { purged }; }
+	for (const name of names) {
+		if (!name.endsWith('.json')) continue;
+		const sessionId = name.slice(0, -'.json'.length);
+		if (sessionId === '' || onDisk.has(sessionId)) continue;
+		const file = join(projcacheDir, name);
+		try {
+			let cwd;
+			try { cwd = JSON.parse(readFileSync(file, 'utf8'))?.record?.identity?.cwd; } catch { cwd = undefined; }
+			if (typeof cwd === 'string' && cwd !== '') {
+				// 双保险：按缓存行自己的 cwd 复算位置，磁盘上在就别删。
+				if (existsSync(join(sessionsRoot, projectKey(cwd), sessionId))) continue;
+			}
+			rmSync(file, { force: true });
+			purged.push(sessionId);
+		} catch { /* 单行失败不影响其余 */ }
+	}
+	return { purged };
+}

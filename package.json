@@ -1,7 +1,7 @@
 {
   "name": "dsh-wm-toolkit",
-  "version": "0.1.0",
-  "description": "撤回、编辑指令与回复（连思考过程一起改）、用原提问重新生成、会话归档/删除/跨工作区移动与工作区迁移。 Recall, edit prompts and replies (reasoning included), regenerate with the original prompt, session archive/delete, cross-workspace move, and workspace migration.",
+  "version": "0.2.4",
+  "description": "撤回、编辑指令与回复（连思考过程一起改）、用原提问重新生成、删除任意一条指令或回复（模型上下文级，不改写日志）、会话归档/删除/跨工作区移动与工作区迁移。 Recall, edit prompts and replies (reasoning included), regenerate with the original prompt, delete any single prompt or reply (context-level, log untouched), session archive/delete, cross-workspace move, and workspace migration.",
   "type": "module",
   "main": "./lib/index.js",
   "exports": {
@@ -22,7 +22,7 @@
   ],
   "dsh": {
     "displayName": "WM 工具集",
-    "displayDescription": "消息可改 + 会话/工作区可管（一个插件）",
+    "displayDescription": "消息可改可删 + 会话/工作区可管（一个插件）",
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
@@ -63,12 +63,17 @@
     "message-recall",
     "message-edit",
     "assistant-edit",
+    "message-delete",
+    "delete-message",
+    "surface-replace",
     "regenerate",
     "session-manager",
     "workspace-migration",
     "撤回",
     "重编辑",
     "重新生成",
+    "删除消息",
+    "删除回复",
     "会话管理",
     "工作区迁移"
   ]

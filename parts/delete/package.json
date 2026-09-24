@@ -1,0 +1,45 @@
+{
+  "name": "dsh-wm-delete",
+  "version": "0.1.0",
+  "description": "[dsh-wm-toolkit 半边] 消息级删除：按条删除指令、按步骤删除思考与工具调用、按整条删除 AI 回复——经官方 surface-replace 契约从模型上下文移除并从转录隐藏，原始只追加日志不改写。派生自 MIT 插件 dsh-delete-turn。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "displayName": "WM 消息删除",
+    "displayDescription": "删除任意一条指令或回复（模型上下文级，不改写日志）",
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "slots",
+        "locale"
+      ],
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "message-delete",
+    "delete-message",
+    "surface-replace",
+    "context-editing",
+    "删除消息",
+    "删除回复"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "node tests/wm-delete-logic.test.mjs"
+  }
+}

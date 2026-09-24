@@ -358,6 +358,51 @@ function claimedInLog(events, messageId) {
   return events.some((e) => e.type === 'user/message' && e.data && e.data.id === messageId);
 }
 
+/** 读一个 live 会话的事件（`snapshotEvents()` 优先，rc.2 旧宿主回退 `.events`）。 */
+function readSessionEvents(session) {
+  if (!session) return null;
+  if (typeof session.snapshotEvents === 'function') {
+    try {
+      const events = session.snapshotEvents();
+      if (Array.isArray(events)) return events;
+    } catch (e) { /* 落到 .events */ }
+  }
+  return Array.isArray(session.events) ? session.events : null;
+}
+
+/**
+ * 找出 fork 之后**被复活**的排队消息 id。
+ *
+ * 为什么会有复活物（实测 dsh 0.1.5-rc.2 的 fork 门面，dsh-api-session-controller#fork）：
+ *   ① 收到 atSeq 后，**往后**找第一个 `turn/end`（`event.seq >= atSeq`）作为边界；
+ *   ② 再从该边界 +1 一路往后走，直到遇到下一个 `turn/start` 为止，把这中间的**全部事件**吞进子会话 seed。
+ * 于是 `(边界, 下一个 turn/start)` 之间的 `agent/inbox/spliced` **入队记录**会进子会话，
+ * 而它们的**出队记录**在那一轮 turn 里面、留在源会话 —— 子会话 seed 的队列被整段复活，
+ * 第一个回合又把源会话早就消费掉的指令认领一次。表现就是：
+ * 「改了指令 → 原指令没变、又被重跑一遍，编辑后的文本排在后面」。
+ *
+ * 判据：**源会话此刻真实还排着的队列才是真值**。子会话 seed 队列里凡是源会话队列里已经没有的，
+ * 都是 fork 截断造出来的幽灵，一律清掉；源会话仍排着的（用户真的还等着跑的）原样不动。
+ *
+ * ⚠️ 只传**子会话的 seed 前缀**（`inheritedEventCount` 之前的事件），不要把 fork 之后新入队的
+ * 编辑文本也算进来——否则它也会被当成幽灵删掉。
+ *
+ * @param sourceEvents 源会话完整事件序列。
+ * @param seedEvents 子会话的 seed 前缀事件（`events.slice(0, inheritedEventCount)`）。
+ * @returns 需要从子会话队列里移除的消息 id（按队列顺序）。
+ */
+function resurrectedQueueIds(sourceEvents, seedEvents) {
+  const sourceQueue = new Set();
+  for (const message of foldPendingTurnInbox(sourceEvents)) {
+    if (message && typeof message.id === 'string') sourceQueue.add(message.id);
+  }
+  const out = [];
+  for (const message of foldPendingTurnInbox(seedEvents)) {
+    if (message && typeof message.id === 'string' && !sourceQueue.has(message.id)) out.push(message.id);
+  }
+  return out;
+}
+
 /**
  * 目标消息所在回合是否仍在进行（最后一条 turn/end 之后仍有事件）。
  * 未闭合回合内撤回会把尚未落盘的输入截断掉，故一并拒绝。
@@ -395,7 +440,19 @@ function resolveBoundary(ctx, sessionId, targetSeq, targetMessageId) {
   // 认领之前该消息还没有 user/message 事件（只有 inbox 入队记录），所以按消息 id 匹配队列，
   // 不能等 targetIdx 找到再做——那时它已经被认领，窗口就错过了。
   // 放行的前提：它已经作为 user/message 进入记录，说明回合已经跑过。
-  if (pendingInboxMessageId(events, targetMessageId) !== null && !claimedInLog(events, targetMessageId)) {
+  //
+  // ⚠️ 实测 dsh 0.1.5-rc.2：chat store 的 `kind:"user"` 节点**不带 messageId**（只有 `steering`
+  // 节点带），客户端因此只能送 null，守卫会**静默失效**（日志里 hasMessageId:false）。
+  // 这里用 targetSeq 从日志里把 id 补出来：目标已认领时它的 user/message 就在这个 seq 上。
+  // 补不出来（真的还排在队列里、那条 seq 不是 user/message）就退回原行为，不会削弱守卫。
+  let effectiveMessageId = targetMessageId;
+  if ((typeof effectiveMessageId !== 'string' || effectiveMessageId.length === 0) && Number.isSafeInteger(targetSeq)) {
+    const atSeq = events.find((e) => e.seq === targetSeq);
+    if (atSeq && atSeq.type === 'user/message' && atSeq.data && typeof atSeq.data.id === 'string') {
+      effectiveMessageId = atSeq.data.id;
+    }
+  }
+  if (pendingInboxMessageId(events, effectiveMessageId) !== null && !claimedInLog(events, effectiveMessageId)) {
     return {
       code: 'message-pending',
       status: 409,
@@ -431,7 +488,7 @@ function resolveBoundary(ctx, sessionId, targetSeq, targetMessageId) {
 }
 
 /** 仅测试用：暴露内部纯函数（不参与运行时行为）。 */
-export const __test = { findTurnEndBefore, resolveBoundary, pendingInboxMessageId, inOpenTurn, writeLog, flushLogBuffer, getLogBuffer: () => logBuffer };
+export const __test = { findTurnEndBefore, resolveBoundary, pendingInboxMessageId, resurrectedQueueIds, readSessionEvents, foldPendingTurnInbox, inOpenTurn, writeLog, flushLogBuffer, getLogBuffer: () => logBuffer };
 
 export function apply(ctx) {
   writeLog('info', 'host', 'apply: 路由注册开始');
@@ -784,6 +841,65 @@ export function apply(ctx) {
         });
       } catch (err) {
         writeLog('error', 'assistant-edit', '/bubble/recall-assistant 异常', { message: String(err?.message ?? err) });
+        sendJson(res, 500, { ok: false, error: 'internal' });
+      }
+    }
+  }));
+  // ---- fork 之后清掉"复活"的排队消息 ----
+  // 官方 fork 门面（dsh-api-session-controller#fork）会把边界之后、下一轮 turn/start 之前的记账事件
+  // 一起吞进子会话，其中包括 inbox 的**入队记录**；它们的出队记录留在源会话 → 子会话开张时队列被
+  // 整段复活，第一个回合会把源会话早就消费掉的指令再认领一次（原指令被重跑）。
+  // 这里在子会话开始跑之前，用官方 sessionController.updateQueue(kind:'remove') 把复活物删掉。
+  disposers.push(ctx.webServer.register({
+    kind: 'exact',
+    path: '/bubble/purge-resurrected-queue',
+    handler: async (req, res) => {
+      try {
+        if (req.method !== 'POST') { sendJson(res, 405, { ok: false, error: 'method-not-allowed' }); return; }
+        const body = await readJsonBody(req, 16 * 1024);
+        const childSessionId = typeof body.childSessionId === 'string' ? body.childSessionId.trim() : '';
+        const sourceSessionId = typeof body.sourceSessionId === 'string' ? body.sourceSessionId.trim() : '';
+        // 会话 id 形态因 profile 而异（既有 uuid 也有 `aa_..._sess_...` 这类带下划线的），
+        // 所以只做长度与类型检查，不套 uuid 正则。
+        if (!guard(req, res, false)
+          || childSessionId.length === 0 || childSessionId.length > 200
+          || sourceSessionId.length === 0 || sourceSessionId.length > 200) {
+          sendJson(res, 400, { ok: false, error: 'invalid-request' });
+          return;
+        }
+        const sourceEvents = readSessionEvents(ctx.sessions.get(sourceSessionId));
+        const childSession = ctx.sessions.get(childSessionId);
+        const childEvents = readSessionEvents(childSession);
+        if (!sourceEvents || !childEvents) {
+          writeLog('warn', 'queue-purge', '会话不可读，跳过清理', { childSessionId, sourceSessionId });
+          sendJson(res, 200, { ok: true, removed: [], skipped: 'session-unavailable' });
+          return;
+        }
+        // 只折叠子会话的 seed 前缀：fork 之后新入队的（也就是编辑后的文本）绝不能算幽灵。
+        const inherited = childSession && typeof childSession.inheritedEventCount === 'number'
+          ? childSession.inheritedEventCount
+          : childEvents.length;
+        const seedEvents = childEvents.slice(0, inherited);
+        const targets = resurrectedQueueIds(sourceEvents, seedEvents);
+        if (targets.length === 0) { sendJson(res, 200, { ok: true, removed: [] }); return; }
+        let controller = null;
+        try { controller = ctx.get('sessionController'); } catch (e) { controller = null; }
+        const removed = [];
+        const failed = [];
+        for (const itemId of targets) {
+          if (!controller || typeof controller.updateQueue !== 'function') { failed.push(itemId); continue; }
+          try {
+            await controller.updateQueue({ sessionId: childSessionId, itemId, action: { kind: 'remove' } });
+            removed.push(itemId);
+          } catch (e) {
+            failed.push(itemId);
+            writeLog('warn', 'queue-purge', '移除复活排队消息失败（跳过）', { itemId, err: String(e?.message ?? e) });
+          }
+        }
+        writeLog('info', 'queue-purge', '已清理 fork 复活的排队消息', { childSessionId, sourceSessionId, removed, failed });
+        sendJson(res, 200, { ok: true, removed, failed });
+      } catch (err) {
+        writeLog('error', 'queue-purge', '/bubble/purge-resurrected-queue 异常', { message: String(err?.message ?? err) });
         sendJson(res, 500, { ok: false, error: 'internal' });
       }
     }

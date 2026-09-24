@@ -59,7 +59,7 @@
   ],
   "license": "MIT",
   "scripts": {
-    "test": "node tests/guard-pending-inbox.test.mjs",
+    "test": "node tests/wm-assistant-edit.test.mjs && node tests/purge-resurrected-queue.test.mjs && node tests/purge-queue-host.test.mjs",
     "build": "node build.mjs",
     "prepare": "node build.mjs",
     "prepack": "node build.mjs"

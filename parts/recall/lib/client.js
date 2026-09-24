@@ -3027,6 +3027,28 @@ addToComposer(props.inputActions, bIds);
             var registered = await registerRelation(rowId, newId, members);
             if (!registered) log("warn", "edit", "版本关系登记失败（侧栏暂显示两行，切换仍继续）", { rowId: rowId, newId: newId });
           }
+          // 官方 fork 会把「边界之后、下一轮 turn/start 之前」的记账事件一起吞进子会话，其中包含
+          // agent inbox 的**入队记录**；而它们的**出队记录**在那一轮 turn 里、留在源会话 —— 于是
+          // 子会话开张时队列被整段复活，第一个回合会把源会话早就消费掉的指令再认领一次。
+          // 表现就是「改了指令 → 原指令没变、又被重跑一遍，编辑后的文本排在后面」。
+          // 必须赶在投递编辑文本之前，用官方 updateQueue(remove) 把复活的幽灵清掉。
+          try {
+            var purgeResp = await fetch("/bubble/purge-resurrected-queue", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ childSessionId: newId, sourceSessionId: sid })
+            });
+            var purgeData = await purgeResp.json();
+            var purged = (purgeData && Array.isArray(purgeData.removed)) ? purgeData.removed : [];
+            log("info", "edit", "清理 fork 复活的排队消息", {
+              newId: newId,
+              removed: purged.length,
+              failed: (purgeData && purgeData.failed) || []
+            });
+          } catch (ePurge) {
+            // 清理失败不阻断编辑：最坏退回旧行为（原指令可能被重跑一遍），但编辑文本仍会投递。
+            log("warn", "edit", "清理复活队列失败（继续投递编辑文本）", { err: String(ePurge && ePurge.message ? ePurge.message : ePurge) });
+          }
           try { claimResume(newId); } catch (eClaim) { /* 订阅兜底仍会认领 */ }
           // 受控切换：后台准备新版本（prepare 不选中）→ 打开 → 订阅确认 → 成功后归档旧版本。
           // 用户等待时切到其他会话：controlledSwitch 只管自己的目标，不强行切回；

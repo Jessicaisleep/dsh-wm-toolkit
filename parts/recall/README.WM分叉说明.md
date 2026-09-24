@@ -27,9 +27,11 @@
 | 文件 | 改动 |
 | --- | --- |
 | `lib/wm-assistant-edit.js` | **新增**。工件读改写核心（移植自 `dsh-session-manager-wm` 中已验证的会话工件读改写路径）：多帧 zstd 解码、按行改写、header 帧契约、原子发布 + 落盘自检 + 备份、边界解析。 |
-| `lib/index.js` | 新增两条路由：`/bubble/recall-assistant`（边界）、`/bubble/edit-assistant`（改写）；自更新路由改为指向 `dsh-message-recall-wm`。 |
-| `lib/client.js` | 新增 `findAssistantReplyTarget` / `openAssistantEditDialog`（自绘对话框，Electron 不支持 `prompt`/`confirm`）/ `runAssistantEdit` / `AssistantEditAction`，并注册进 `conversation.chat.assistant-actions` 槽（order 20，排在版本翻页器之后）。 |
+| `lib/index.js` | 新增两条路由：`/bubble/recall-assistant`（边界）、`/bubble/edit-assistant`（改写）；**0.2.2 再加 `/bubble/purge-resurrected-queue`（清 fork 复活的排队消息），并让 `resolveBoundary` 用 `targetSeq` 补出 messageId**；自更新路由改为指向 `dsh-message-recall-wm`。 |
+| `lib/client.js` | 新增 `findAssistantReplyTarget` / `openAssistantEditDialog`（自绘对话框，Electron 不支持 `prompt`/`confirm`）/ `runAssistantEdit` / `AssistantEditAction`，并注册进 `conversation.chat.assistant-actions` 槽（order 20，排在版本翻页器之后）。**0.2.2 在 `confirmEdit` 的 fork 成功后加了一次清理调用。** |
 | `tests/wm-assistant-edit.test.mjs` | **新增**离线单测：在**真实会话日志的副本**上验证"只有目标那一行变、其余逐字节不变"。 |
+| `tests/purge-resurrected-queue.test.mjs` | **新增（0.2.2）**：15 项。事件序列逐条照抄真实故障会话，断言 bug 前提、清理判据、误删保护与守卫行为。 |
+| `tests/purge-queue-host.test.mjs` | **新增（0.2.2）**：8 项。`/bubble/purge-resurrected-queue` 的宿主集成：调用形状、只删幽灵、保留真实排队、失败降级、参数校验。 |
 | `package.json` / `cordis.patch.yml` | 改名与版本号。 |
 
 **没有**改动的上游行为：撤回（`/bubble/recall`）、编辑我的消息、版本翻页器、关系登记、草稿备份、设置卡、日志。路由前缀仍是 `/bubble/*`，localStorage 设置键仍是 `dsh-message-recall:*`（升级过来时用户设置不丢）。
@@ -80,7 +82,39 @@ $env:ELECTRON_RUN_AS_NODE='1'
 
 20 项断言，覆盖：行数不变、header 逐字节不变、帧 0 契约、只有目标行变化、`seq/time/type` 保持、非 text 块（reasoning / tool-call）原样保留、往返解码、三条定位路径、`replaceAllTextInMessage` 选项、以及边界解析的 6 种情形（保留目标回合 / 只给 turn / 非助手消息 / 未闭合回合 / 无文本块 / 会话不存在）。
 
-## 六、已知边界
+## 六、0.2.2 修复：编辑指令后「原指令被重跑一遍」
+
+**现象**：改完一条指令，原指令没变、又被重跑了一遍，编辑后的文本排在它后面。
+
+**根因**（逐条 dump 真实会话日志后确认，在官方 fork 门面 `dsh-api-session-controller#fork`）：
+
+```
+const boundary = source.events.find(e => e.type === "turn/end" && e.seq >= atSeq)  // ① 往后找第一个 turn/end
+let cut = boundary.seq + 1
+while (cut < events.length && events[cut]?.type !== "turn/start") cut++            // ② 一路吞到下一个 turn/start
+```
+
+② 这一步会把「边界之后、下一轮 `turn/start` 之前」的**全部记账事件**吞进子会话 seed，
+其中包括 `agent/inbox/spliced` 的**入队记录**；而对应的**出队记录**在那一轮 turn 里、留在源会话。
+于是子会话 seed 的队列被整段复活，第一个回合又把源会话早就消费掉的指令认领一次。
+
+**光调 `atSeq` 修不掉**：目标消息之前只有一个 `turn/end`，`atSeq` 取多小都会让 ① 选中它、② 吞到下一轮开始前。
+
+**修法**：fork 成功之后、投递编辑文本之前清理一次。
+
+- 新增宿主路由 `POST /bubble/purge-resurrected-queue { childSessionId, sourceSessionId }`；
+- 判据：**源会话此刻仍在排队的队列才是真值**。子会话 **seed 前缀**
+  （`events.slice(0, inheritedEventCount)`）里凡源会话队列已经没有的，都是 fork 截断造出来的幽灵；
+- 删除走**官方** `sessionController.updateQueue({ sessionId, itemId, action: { kind: 'remove' } })`
+  （`dsh-api-session-controller` 的 `updateQueue`，注释明确写着 *without resuming a cold Agent*，正好适合这个时机）；
+- **只折叠 seed 前缀**是关键：否则编辑后新入队的文本也会被当成幽灵删掉；
+- 源会话里仍排着的（用户真的还等着跑的）消息保留；单条失败只进 `failed`，不阻断编辑投递。
+
+顺带修了 `hasMessageId: false`：客户端读 `node.data.id`，但 dsh 0.1.5-rc.2 的 chat store 里
+`kind:"user"` 节点**不带 messageId**（只有 `steering` 带），于是 `message-pending` 守卫静默失效。
+现在宿主在 `resolveBoundary` 里用 `targetSeq` 从日志补出 id；补不出来就退回原行为。
+
+## 七、已知边界
 
 - **无文本回复不可编辑**：纯工具调用回合没有 `text` 块 → 不显示 ✎。
 - **未闭合回合不可编辑**：回合未结束（没有 `turn/end`）→ 提示"等回复完成后再编辑"。
