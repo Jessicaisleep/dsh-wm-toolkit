@@ -413,6 +413,119 @@ check('没有会话 id 时（新会话输入框）不发请求、不崩', () => 
   void row;
 });
 
+// ---------------------------------------------------------------- 新内容乐观放行
+//
+// 回归：surface / replyTurns 只在会话打开时抓一次，于是"刚发出的消息、刚完成的回复"
+// 的 seq 不在旧 surface 里 → 被判成不可删 → 按钮不出现，必须重启 DSH 才有。
+// 现在对"seq 超过上次抓取末尾"的新内容乐观放行，并防抖刷新 surface 做精确校正。
+
+// 这批测试手动 publish view；load() 不能覆盖它 → 给一个永不 resolve 的 fetch
+// （load 的 .finally 不会跑，也就不会 publish）。
+globalThis.fetch = () => new Promise(() => {});
+
+check('新内容（seq 超过上次 surface 抓取末尾）→ 删除按钮照样出现，不必重启', () => {
+  documentRoot.children.length = 0;
+  const { component, controller } = mount();
+  const { actions } = recallUserRow('n1', 30);
+  controller.publish({ surfaceReady: true, surface: new Set([10, 12]), lastSeq: 20 });
+  render(component, controller, { n1: userNode(30) });
+  assert.equal(actions.children.length, 4, '新消息也应有删除按钮');
+  assert.ok(actions.children[3].classList.contains('dshwd-inline'));
+  controller.dispose();
+});
+
+check('新内容不会被标记 data-dshwd-no-target（那会把官方槽的删除按钮一起藏掉）', () => {
+  documentRoot.children.length = 0;
+  const { component, controller } = mount();
+  const { row } = recallUserRow('n2', 31);
+  controller.publish({ surfaceReady: true, surface: new Set([10]), lastSeq: 20 });
+  render(component, controller, { n2: userNode(31) });
+  assert.equal(row.dataset.dshwdNoTarget, undefined, '新内容绝不能设 no-target');
+  controller.dispose();
+});
+
+check('新回合的 turn-tail 行同样乐观放行（不设 no-target）', () => {
+  documentRoot.children.length = 0;
+  const { component, controller } = mount();
+  const row = el('div', { 'data-chat-flow-key': 'n6' });
+  row.appendChild(el('div', {}, { display: 'block' }));
+  documentRoot.appendChild(row);
+  controller.publish({ surfaceReady: true, replyTurns: new Set([1]), surface: new Set([10]), lastSeq: 20 });
+  // closing.finalNode.messageId 存在 → targetFor 返回 null（交给官方槽），
+  // 但 rowDeletable 必须放行，否则 no-target 会把官方槽按钮藏掉。
+  render(component, controller, {
+    n6: { kind: 'turn-tail', anchorSeq: 30, data: { turn: 9, closing: { finalNode: { seq: 30, messageId: 'msg-new' } } } },
+  });
+  assert.equal(row.dataset.dshwdNoTarget, undefined, '新回合不该被标记为无入口');
+  controller.dispose();
+});
+
+check('老内容仍按 surface 精确判断（该藏的还是藏）', () => {
+  documentRoot.children.length = 0;
+  const { component, controller } = mount();
+  const { actions, row } = recallUserRow('n3', 11);
+  controller.publish({ surfaceReady: true, surface: new Set([10]), lastSeq: 20 });
+  render(component, controller, { n3: userNode(11) });
+  assert.equal(actions.children.length, 3, '不在 surface 里的老内容不显示删除按钮');
+  assert.equal(row.dataset.dshwdNoTarget, '1');
+  controller.dispose();
+});
+
+check('看到新内容会安排一次防抖刷新（不是立即发请求）', () => {
+  documentRoot.children.length = 0;
+  const { component, controller } = mount();
+  recallUserRow('n4', 32);
+  controller.publish({ surfaceReady: true, surface: new Set([10]), lastSeq: 20 });
+  controller.dispose(); // 清掉可能存在的旧 timer
+  assert.equal(controller.refreshTimer, null);
+  render(component, controller, { n4: userNode(32) });
+  assert.notEqual(controller.refreshTimer, null, '应已调度刷新');
+  controller.dispose();
+  assert.equal(controller.refreshTimer, null, 'dispose 应清掉 timer');
+});
+
+check('没有新内容时不调度刷新（稳态零额外请求）', () => {
+  documentRoot.children.length = 0;
+  const { component, controller } = mount();
+  recallUserRow('n5', 12);
+  controller.publish({ surfaceReady: true, surface: new Set([10, 12]), lastSeq: 20 });
+  controller.dispose();
+  render(component, controller, { n5: userNode(12) });
+  assert.equal(controller.refreshTimer, null, '稳态下不该有刷新');
+});
+
+check('lastSeq 为 -1（还没抓过 surface）时不误判为新内容', () => {
+  documentRoot.children.length = 0;
+  const { component, controller } = mount();
+  const { actions } = recallUserRow('n7', 50);
+  // surfaceReady=true 但 lastSeq 未知 → 不应走乐观放行；靠 surface 精确判断
+  controller.publish({ surfaceReady: true, surface: new Set([10]), lastSeq: -1 });
+  render(component, controller, { n7: userNode(50) });
+  assert.equal(actions.children.length, 3, 'lastSeq 未知时不乐观放行');
+  controller.dispose();
+});
+
+// load() 会从 /state 读入 lastSeq（否则乐观放行永远不触发）。这条是 async，单独跑。
+try {
+  globalThis.fetch = () => Promise.resolve({
+    ok: true,
+    json: async () => ({ ok: true, hidden: [], surface: [10, 12, 30], replyTurns: [1], lastSeq: 30 }),
+  });
+  const { controller } = mount();
+  controller.load();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const view = controller.getSnapshot();
+  assert.equal(view.lastSeq, 30, 'lastSeq 应来自 /state');
+  assert.equal(view.surfaceReady, true);
+  assert.equal(view.surface.has(30), true);
+  passed += 1;
+  console.log('  ✓ load() 从 /state 读入 lastSeq（乐观放行的前提）');
+} catch (error) {
+  failed += 1;
+  failures.push('load() lastSeq');
+  console.error(`  ✗ load() 从 /state 读入 lastSeq\n    ${String(error && error.message ? error.message : error)}`);
+}
+
 console.log(`\nwm-delete 按钮位置回归：${passed}/${passed + failed} 通过`);
 if (failures.length > 0) console.error('失败项：' + failures.join(' | '));
 process.exit(failed === 0 ? 0 : 1);

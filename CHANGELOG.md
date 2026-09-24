@@ -4,6 +4,45 @@
 半边各自的详细变更史保留在 `parts/recall/CHANGELOG-WM.md` 与 `parts/manager/CHANGELOG.md`；
 本文件只记录**面向使用者**的包级版本。
 
+## 0.2.5 — 2026-09-24
+
+### 修：最新发出的消息 / 刚完成的回复没有删除按钮，必须重启 DSH 才出现
+
+**现象**：刚发的那条指令、刚完成的那个回复，行上没有垃圾桶；重启 DSH 后按钮才出现。
+
+**根因**：`view.surface` / `view.replyTurns`（判断"内容是否还在模型上下文里"的依据）
+**只在会话打开时抓了一次**：
+
+- `load()` 在 `loaded === true` 且非 force 时直接返回；
+- `OverlayEntry` 的 effect 只在 `controller` 变化时调 `load()`（非 force）。
+
+于是新消息的 seq **永远不在**那份旧 surface 里 → `rowDeletable()` 判成"不可删"：
+
+| 受影响的行 | 后果 |
+|---|---|
+| 用户消息行 | 不注入 DOM 按钮 ✗ |
+| `turn-tail`（回合尾）行 | 被打上 `data-dshwd-no-target="1"`，而那条 CSS 会**把官方槽的按钮一起隐藏** ✗（所以 AI 回复也没按钮） |
+
+重启后所有消息都变成"历史"，`/state` 一抓就包含它们 → 按钮出现。
+
+**修法**（只改客户端半边）：
+
+1. **新内容乐观放行**：行的 seq 比上次抓取时的日志末尾（`/wm-delete/state` 早就返回的
+   `lastSeq` 字段）还大 → 说明是抓取之后才产生的 → 直接放行，**按钮立即出现**。
+2. **防抖刷新**：`applyDom` 发现新内容时调度 `scheduleRefresh()`（800ms 防抖，
+   把流式回复期间的连续变化合并成一次）→ `load(true)` 拉最新 surface 做精确校正
+   （例如排除已被 `/compact` 移出上下文的内容）。
+3. 老内容仍按 surface 精确判断，`data-dshwd-no-target` 的语义不变（该藏的还藏）。
+
+**效果**：按钮即时出现（不等请求往返），稳态零额外请求。
+
+### 测试
+
+`parts/delete/tests/wm-delete-placement.test.mjs` 从 9 项扩到 17 项，新增覆盖：
+新内容放行、`no-target` 不被设置、新回合 `turn-tail` 同样放行、老内容仍精确判断、
+防抖调度不立即发请求、`dispose()` 清理计时器、`lastSeq === -1` 不误判、
+`load()` 确实从 `/state` 读入 `lastSeq`。汇总仍 11 套。
+
 ## 0.2.4 — 2026-09-24
 
 ### 修：`coldSnapshot` 签名不匹配，启动时每个会话都抛错（既有 bug）

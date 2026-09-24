@@ -172,10 +172,16 @@ window.__ModuleLoader__.load({
         this.listeners = new Set();
         this.inflight = null;
         this.animateOnce = false;
+        /** surface 抓取之后的防抖刷新计时器（见 scheduleRefresh）。 */
+        this.refreshTimer = null;
         this.view = Object.freeze({
           hidden: new Map(),
           surface: new Set(),
           replyTurns: new Set(),
+          // 上次抓 surface 时的日志末尾 seq。用来识别"抓完之后又产生了新内容"——
+          // 那些内容的 seq 不在 surface 里，但绝不能因此被判成不可删（否则刚发出的消息、
+          // 刚完成的回复都没有删除入口，要重启 DSH 才出现）。
+          lastSeq: -1,
           surfaceReady: false,
           loaded: false,
           loadError: false,
@@ -234,7 +240,15 @@ window.__ModuleLoader__.load({
             for (const seq of Array.isArray(data.surface) ? data.surface : []) surface.add(seq);
             const replyTurns = new Set();
             for (const turn of Array.isArray(data.replyTurns) ? data.replyTurns : []) replyTurns.add(turn);
-            this.publish({ hidden, surface, replyTurns, surfaceReady: true, loaded: true, loadError: false });
+            this.publish({
+              hidden,
+              surface,
+              replyTurns,
+              lastSeq: typeof data.lastSeq === 'number' ? data.lastSeq : -1,
+              surfaceReady: true,
+              loaded: true,
+              loadError: false,
+            });
           })
           .catch(() => {
             this.publish({ loadError: true });
@@ -244,6 +258,23 @@ window.__ModuleLoader__.load({
           });
         this.inflight = pending;
         return pending;
+      }
+
+      /**
+       * 防抖地重新抓一次 surface。
+       *
+       * 为什么要防抖：流式回复期间 chat 快照每个 token 都在变、新 seq 不断出现，
+       * 每次都发请求会把 `/wm-delete/state` 刷爆。这里把多次请求合并成"内容稳定后的一次"——
+       * 期间按钮由 {@link rowDeletable} 的乐观放行保证可见，刷新只负责精确校正
+       * （例如排除已经被 /compact 移出上下文的内容）。
+       */
+      scheduleRefresh() {
+        if (!usableSessionId(this.sessionId)) return;
+        if (this.refreshTimer !== null) clearTimeout(this.refreshTimer);
+        this.refreshTimer = setTimeout(() => {
+          this.refreshTimer = null;
+          this.load(true);
+        }, 800);
       }
 
       open(target) {
@@ -287,6 +318,10 @@ window.__ModuleLoader__.load({
       }
 
       dispose() {
+        if (this.refreshTimer !== null) {
+          clearTimeout(this.refreshTimer);
+          this.refreshTimer = null;
+        }
         this.listeners.clear();
       }
     }
@@ -523,10 +558,25 @@ window.__ModuleLoader__.load({
       if (host.parentElement !== think) think.appendChild(host);
     }
 
+    /**
+     * 这一行是否承载着"surface 抓取之后才出现"的新内容。
+     *
+     * 判据：行的 surface seq 比上次抓取时的日志末尾（`view.lastSeq`）还大。
+     * 这类内容不可能出现在旧 surface 里，用旧 surface 判"不可删"会把刚发出的消息、
+     * 刚完成的回复的删除入口全部藏掉——表现为"必须重启 DSH 才出现删除按钮"。
+     */
+    function isNewContent(seqs, view) {
+      if (typeof view.lastSeq !== 'number' || view.lastSeq < 0) return false;
+      return seqs.some((seq) => typeof seq === 'number' && seq > view.lastSeq);
+    }
+
     // 只有内容还在模型上下文里时才提供入口：官方 /compact（或别的生产者）可以把一个回合
     // 移出 surface，而转录行是刻意保留显示的。
     function rowDeletable(node, seqs, view) {
       if (!view.surfaceReady) return true;
+      // 新内容先乐观放行。surface 抓取是异步的：这里是"立即显示按钮"，
+      // applyDom 会同时安排一次防抖刷新，下一帧再用新 surface 精确校正。
+      if (isNewContent(seqs, view)) return true;
       const data = node.data || {};
       if (node.kind === 'turn-tail' || node.kind === 'turn-process' || node.kind === 'turn-error' || node.kind === 'model-retry') {
         if (typeof data.turn === 'number') return view.replyTurns.has(data.turn);
@@ -544,6 +594,9 @@ window.__ModuleLoader__.load({
       if (!snapshot || !snapshot.nodes || typeof snapshot.nodes.get !== 'function') return;
       const animate = controller.consumeAnimate();
       const rows = document.querySelectorAll('[data-chat-flow-key]');
+      // 这一帧里有没有"surface 抓取之后才出现"的内容。有就安排一次防抖刷新，
+      // 让下一帧的判定建立在最新 surface 上（按钮本身已由乐观放行显示出来）。
+      let sawNewContent = false;
       for (const row of rows) {
         if (!(row instanceof HTMLElement)) continue;
         const key = row.getAttribute('data-chat-flow-key');
@@ -551,6 +604,7 @@ window.__ModuleLoader__.load({
         const node = snapshot.nodes.get(key);
         if (!node) continue;
         const seqs = seqsFor(node);
+        if (isNewContent(seqs, view)) sawNewContent = true;
         const hidden = isRowHidden(view.hidden, seqs);
         setRowHidden(row, hidden, animate);
         const target = hidden ? null : targetFor(node);
@@ -566,10 +620,15 @@ window.__ModuleLoader__.load({
         const node = row ? snapshot.nodes.get(row.getAttribute('data-chat-flow-key')) : undefined;
         const final = node && node.kind === 'assistant-step' ? node.data.finalNode : undefined;
         const seq = final && typeof final.seq === 'number' ? final.seq : undefined;
-        const allowed = seq !== undefined && !view.hidden.has(seq) && (!view.surfaceReady || view.surface.has(seq));
+        if (typeof seq === 'number' && isNewContent([seq], view)) sawNewContent = true;
+        const allowed = seq !== undefined && !view.hidden.has(seq)
+          && (!view.surfaceReady || isNewContent([seq], view) || view.surface.has(seq));
         if (!allowed) removeThinkAction(think);
         else injectThinkAction(think, { mode: 'step', seq, label: 'step' }, controller, t);
       }
+      // 看到新内容 → 安排一次防抖刷新，把 surface 追到最新。
+      // 放在最后：一帧只调度一次（scheduleRefresh 内部还会合并多次调用）。
+      if (sawNewContent) controller.scheduleRefresh();
     }
 
     // --- React 入口 ------------------------------------------------------------

@@ -1,6 +1,6 @@
 {
   "name": "dsh-wm-toolkit",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "撤回、编辑指令与回复（连思考过程一起改）、用原提问重新生成、删除任意一条指令或回复（模型上下文级，不改写日志）、会话归档/删除/跨工作区移动与工作区迁移。 Recall, edit prompts and replies (reasoning included), regenerate with the original prompt, delete any single prompt or reply (context-level, log untouched), session archive/delete, cross-workspace move, and workspace migration.",
   "type": "module",
   "main": "./lib/index.js",
