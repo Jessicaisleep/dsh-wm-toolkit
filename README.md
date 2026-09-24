@@ -149,10 +149,29 @@ npm run test       # 各半边的离线单测（11 套）
 | `parts/delete/tests/wm-delete-logic.test.mjs` | 删除逻辑：折叠 / 规划 / 台账 / 安全拒绝（26 项） |
 | `parts/delete/tests/wm-delete-host.test.mjs` | 删除宿主集成 + **官方 `foldSurface` 契约验收**（20 项） |
 | `parts/delete/tests/wm-delete-client.smoke.mjs` | 浏览器半边冒烟（7 项） |
-| `parts/delete/tests/wm-delete-placement.test.mjs` | 删除按钮位置回归·迷你 DOM（9 项） |
+| `parts/delete/tests/wm-delete-placement.test.mjs` | 删除按钮位置回归 + 新内容放行·迷你 DOM（17 项） |
 
 `wm-delete-host.test.mjs` 会动态载入**本机 DSH 安装的官方 `foldSurface`**（`@deepseek-ai/dsh-session`）
 做 surface 契约验收，找不到时明确跳过而不是假通过。
+
+## 发布
+
+**打 tag 即发** —— GitHub Actions + npm Trusted Publishing，Git 和 npm 一起更新，不用发两次：
+
+```bash
+# 1) 改代码 → 升 package.json 的 version，并在 CHANGELOG.md 记一条
+npm run build && npm run test
+# 2) 提交推送
+git add -A && git commit -m "release: X.Y.Z" && git push
+# 3) 打 tag（必须与 package.json 版本一致，工作流会强制校验）
+git tag -a vX.Y.Z -m "dsh-wm-toolkit X.Y.Z" && git push origin vX.Y.Z
+```
+
+CI 会跑 `build.mjs` + `tests/run-all.mjs` + `npm publish --provenance --access public`。
+
+**前置条件（一次性）**：在 npm 包页面绑定 Trusted Publisher —— 五个字段的填法与当前状态见
+[RELEASE.md](./RELEASE.md) §3。绑定完成前，CI 会一路跑到 `npm publish` 才失败；
+想补发一个已存在的版本时，用 Actions 页面的 **Run workflow** 手动触发（不校验 tag）。
 
 ## 许可
 

@@ -1,6 +1,6 @@
 # RELEASE.md — 发布清单
 
-包名 `dsh-wm-toolkit`（npm 上未被占用，2026-09 核实），当前版本 `0.1.0`。
+包名 `dsh-wm-toolkit`（npm 上未被占用，2026-09 核实），当前版本 `0.2.5`。
 
 ## 0. 发布前的验证状态
 
@@ -53,6 +53,23 @@ npm pack --dry-run
 
 发布走 **GitHub Actions + npm Trusted Publishing（OIDC）**：不需要任何 token、不会过期、自带 provenance 签名。
 工作流见 `.github/workflows/publish.yml`；`0.1.0` 是首个版本（用一次性 token 手工发布），之后都用 CI。
+
+> ### ⚠️ 当前状态（2026-09-24 实测）
+>
+> GitHub 侧的自动发布**已经跑通了前 7 步**（checkout / setup-node / 升级 npm CLI /
+> tag 与版本一致性校验 / `build.mjs` / `run-all.mjs` 测试 全部 ✔），
+> **只卡在最后一步 `npm publish`**。
+>
+> 原因是 §3.1 的 **npm 侧 Trusted Publisher 还没绑定** —— 那是一次性手工操作，
+> 没绑定之前 CI 永远发不出去（本地一个 tag 都没有，也从侧面印证 CI 从没成功过）。
+>
+> npm 上目前只有 **`0.1.0`**（2026-09-18 用一次性 token 手工发的），`0.2.x` 全部还没发布。
+>
+> **绑定之后不需要重新打 tag**：GitHub → **Actions** → “Publish to npm” → **Run workflow**
+> （手动触发不校验 tag，直接用 `package.json` 里的版本）就能补发当前版本。
+>
+> 也就是说：**绑定完成之后，以后发版只需「升版本 + 打 tag + push」一条链**，
+> npm 和 Git 一起更新，不用发两次。
 
 ### 3.1 一次性配置：npm 侧绑定本仓库
 
