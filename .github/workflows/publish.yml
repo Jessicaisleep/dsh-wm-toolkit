@@ -79,8 +79,30 @@ jobs:
           echo "===== registry 复查（publish 之后实际能查到的版本）====="
           sleep 5
           npm view dsh-wm-toolkit version 2>&1 | head -3
-          echo "::warning::npm publish exit=$CODE；步骤名=发布"
-          grep -Ei 'publish|stag|error|warn|notice|registry|auth|provenance' "$LOG" | head -n 8 | while IFS= read -r line; do
-            echo "::warning::npm-publish: $line"
+          echo "::warning::npm publish exit=$CODE"
+          # 只挑真正的错误行。上一版用宽泛的 grep（含 notice），前 8 条全被
+          # "npm notice Tarball Contents" 这类打包清单占满，真正的错误反而被挤掉了。
+          grep -Ei 'npm error|npm ERR|error:|EOTP|ENEEDAUTH|forbidden|denied|not permitted' "$LOG" | head -n 5 | while IFS= read -r line; do
+            echo "::warning::pub-error: $(echo "$line" | tr -d '\r' | sed 's/%/%25/g')"
           done
+          # 兜底：整段日志尾部压成一条 annotation（换行会截断消息，用 | 代替；% 必须转义）
+          TAILMSG=$(tail -c 1200 "$LOG" | tr -d '\r' | tr '\n' '|' | sed 's/%/%25/g')
+          echo "::warning::npm log tail: $TAILMSG"
+
+          # 完整日志写进 job summary：check-run 的 output.summary 是**公开可读**的
+          # （GET /repos/{owner}/{repo}/check-runs/{id}），既不像 annotation 只有 10 条上限，
+          # 也不像 job logs 那样需要认证 —— 排查时用 API 一次就能拿到全部输出。
+          {
+            echo '## 环境'
+            echo '```'
+            echo "node: $(node -v)"
+            echo "npm: $(npm -v)"
+            echo "registry: $(npm config get registry)"
+            echo "always-auth: $(npm config get always-auth 2>&1)"
+            echo '```'
+            echo "## npm publish 日志（exit code: $CODE）"
+            echo '```'
+            cat "$LOG"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
           exit $CODE
