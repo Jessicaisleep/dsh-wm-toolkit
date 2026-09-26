@@ -27,7 +27,7 @@ import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import { PLUGIN_ID, PlanError, deletableReplyTurns, foldSurface, hiddenEntriesOfFold, isBusy, planRange } from './logic.js';
+import { PLUGIN_ID, PlanError, deletableReplyTurns, foldSurface, hiddenEntriesOfFold, isBusy, planRange, pluginSource } from './logic.js';
 
 export const name = 'dsh-wm-delete';
 
@@ -252,7 +252,7 @@ async function deleteTarget(ctx, sessionId, body) {
         id: randomUUID(),
         role: 'user',
         content: [{ type: 'text', text: '[deleted]' }],
-        source: { kind: 'plugin', plugin: PLUGIN_ID },
+        source: pluginSource(),
       },
       {
         surfaceOp: { op: 'replace', startSeq: plan.startSeq, endSeq: plan.endSeq },

@@ -164,6 +164,26 @@ for (const candidate of candidates) {
   }
 }
 
+// 会话格式 v4 的行接纳守卫：正是它在生产环境拒绝 v3 的 plugin 包装，
+// 并让「写替换事件」的整个 turn 在 step 0 失败。
+let officialV4RowAdmission = null;
+const v4Candidates = [
+  process.env.DSH_SESSION_FORMAT_V4_MODULE,
+  'D:\\Program Files (x86)\\DSH Desktop\\resources\\app\\node_modules\\@deepseek-ai\\dsh-session-format-v3-to-v4\\lib\\index.js',
+].filter(Boolean);
+for (const candidate of v4Candidates) {
+  if (!existsSync(candidate)) continue;
+  try {
+    const mod = await import(pathToFileURL(candidate).href);
+    if (typeof mod.assertV4RowAdmission === 'function') {
+      officialV4RowAdmission = mod.assertV4RowAdmission;
+      break;
+    }
+  } catch (error) {
+    console.log(`  （载入官方 v4 格式守卫失败，将跳过该验收：${String(error.message || error)}）`);
+  }
+}
+
 // ---------------------------------------------------------------- 测试
 
 const log = buildLog();
@@ -231,12 +251,33 @@ await check('POST /wm-delete/delete 删一条指令：追加的替换事件形�
   const event = harness.appended[0];
   assert.equal(event.type, 'user/message');
   assert.equal(event.data.role, 'user');
-  assert.deepEqual(event.data.source, { kind: 'plugin', plugin: PLUGIN_ID });
+  // v4 会话格式要求「生产者自己的 kind」：{ kind: 'plugin:<插件名>' }。
+  // 写成 v3 的 { kind: 'plugin', plugin: X } 会被 v4 写入守卫拒绝
+  // （format v4 message requires a producer-owned source kind），整个 turn 都会失败。
+  assert.deepEqual(event.data.source, { kind: `plugin:${PLUGIN_ID}` });
+  assert.notEqual(event.data.source.kind, 'plugin', '不得再写出退役的 v3 plugin 包装');
   assert.match(event.data.content[0].text, /\[deleted\]/);
   assert.deepEqual(event.surfaceOp, { op: 'replace', startSeq: 3, endSeq: 3 });
   assert.deepEqual(event.sourceEventSeqs, [3]);
   assert.equal(typeof event.data.id, 'string');
   assert.equal(event.seq, 11, '新事件应追加在日志尾部');
+});
+
+await check('追加的替换事件能通过官方 v4 行接纳守卫（回归：v3 plugin 包装曾让整个 turn 失败）', () => {
+  if (officialV4RowAdmission === null) {
+    skipped += 1;
+    console.log('    （未找到官方 v4 守卫模块，跳过）');
+    return;
+  }
+  const event = harness.appended[0];
+  // 实际写出的那一行必须被接纳。
+  officialV4RowAdmission(event);
+  // 并且旧写法必须被拒绝——否则这条回归测试就失去意义。
+  assert.throws(
+    () => officialV4RowAdmission({ ...event, data: { ...event.data, source: { kind: 'plugin', plugin: PLUGIN_ID } } }),
+    /producer-owned source kind/,
+    'v3 的 plugin 包装应当被 v4 守卫拒绝',
+  );
 });
 
 await check('删除后 /wm-delete/state 报出隐藏台账，且目标离开 surface', async () => {
@@ -350,7 +391,7 @@ if (officialFoldSurface === null) {
         id: 'bad',
         role: 'user',
         content: [{ type: 'text', text: '[deleted]' }],
-        source: { kind: 'plugin', plugin: PLUGIN_ID },
+        source: { kind: `plugin:${PLUGIN_ID}` },
       },
       surfaceOp: { op: 'replace', startSeq: 6, endSeq: 8 },
       sourceEventSeqs: [6], // 故意漏掉 8
@@ -381,7 +422,7 @@ if (officialFoldSurface === null) {
         id: 'bad',
         role: 'user',
         content: [{ type: 'text', text: '[deleted]' }],
-        source: { kind: 'plugin', plugin: PLUGIN_ID },
+        source: { kind: `plugin:${PLUGIN_ID}` },
       },
       surfaceOp: { op: 'replace', startSeq: 999, endSeq: 999 },
       sourceEventSeqs: [999],
