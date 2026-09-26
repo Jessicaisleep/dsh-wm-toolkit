@@ -18,6 +18,7 @@ const suites = [
   { label: 'manager · 会话迁移核心', file: join(here, '..', 'parts', 'manager', 'tests', 'wm-relocate.test.mjs') },
   { label: 'manager · 孤儿投影缓存清理（损坏会话删不掉）', file: join(here, '..', 'parts', 'manager', 'tests', 'purge-orphan-projcache.test.mjs') },
   { label: 'manager · 投影缓存 identity 对账', file: join(here, '..', 'parts', 'manager', 'tests', 'reconcile-projcache-identity.test.mjs') },
+  { label: 'manager · 图标跨版本兼容（DSH 2.0 席位消失）', file: join(here, '..', 'parts', 'manager', 'tests', 'icon-compat.test.mjs') },
   { label: 'manager · 宿主冒烟', file: join(here, '..', 'parts', 'manager', 'tests', 'smoke-host.cjs') },
   { label: 'delete · 删除逻辑核心', file: join(here, '..', 'parts', 'delete', 'tests', 'wm-delete-logic.test.mjs') },
   { label: 'delete · 宿主集成（含官方 surface 契约验收）', file: join(here, '..', 'parts', 'delete', 'tests', 'wm-delete-host.test.mjs') },

@@ -18,6 +18,29 @@ window.__ModuleLoader__.load({
     const React = require("react");
     const { useState, useEffect, useMemo, useRef, useSyncExternalStore } = React;
     const P = require("@deepseek-ai/dsh-client-ui-primitives");
+    /**
+     * 图标解析：DSH 的图标命名换过代，两代都认。
+     *   旧版（≤ 0.1.5-rc.x）：IconArchiveOutline20（尺寸在后缀）
+     *   新版（2.0.x 起）    ：IconArchiveOutlineRegular + { size }
+     * 解析不到返回 null。**绝不返回 undefined** —— React 遇到 undefined 组件会抛
+     * "Element type is invalid"，整个 slot 渲染失败：DSH 2.0 更新后左下角
+     * 「会话管理」整块消失，就是 FooterAction 里的 IconArchiveOutline20 已经不存在了。
+     */
+    function resolvePrimitiveIcon(base, legacySize) {
+      const names = [base + "Regular", base + "Medium", base, base + "Artwork"];
+      if (typeof legacySize === "string") names.push(base + legacySize);
+      for (const name of names) {
+        const found = P === undefined || P === null ? undefined : P[name];
+        if (typeof found === "function") return found;
+        if (found !== null && found !== undefined && typeof found === "object") return found;
+      }
+      return null;
+    }
+    /** 渲染图标；解析不到渲染 null，而不是让 React 崩掉。 */
+    function renderPrimitiveIcon(node, props) {
+      return node === null ? null : React.createElement(node, props === undefined ? null : props);
+    }
+    const IconArchiveOutline = resolvePrimitiveIcon("IconArchiveOutline", "20");
     if (typeof window !== "undefined") {
       window.__smReact = React;
       window.__smReactDOM = React.createPortal ? React : null;
@@ -1098,7 +1121,7 @@ window.__ModuleLoader__.load({
       );
       return h("div", { className: "sm-footer" },
         h("button", { type: "button", className: "sm-footerBtn", "aria-label": t("footer.aria"), onClick: () => onOpenPanel() },
-          h(P.IconArchiveOutline20, { size: 14 }),
+          renderPrimitiveIcon(IconArchiveOutline, { size: 14 }),
           h("span", null, t("footer.label"))
         ),
         // The panel is mounted ONLY while the user has the modal open. When
@@ -1318,19 +1341,15 @@ window.__ModuleLoader__.load({
       }
     };
 
-    const wmIconName = (() => {
-      if (P === undefined || P === null) return null;
-      for (const candidate of ["IconFolderOpen16", "IconFolderOpenOutline16", "IconFolderClose16", "IconArchiveOutline20"]) {
-        if (P[candidate] !== undefined) return candidate;
-      }
-      return null;
-    })();
+    // 工作区菜单那一项用的图标（同样跨版本解析；解析不到就交给官方默认图标）。
+    const WmFolderIcon = resolvePrimitiveIcon("IconFolderOpenOutline", "16")
+      || resolvePrimitiveIcon("IconFolderOpen", "16");
 
     globalThis.__DSH_WM__ = {
       workspaceMenuItems: () => [{
         id: "dsm-wm-migrate-workspace",
         label: wmT("迁移到新文件夹…", "Migrate to a new folder…"),
-        icon: wmIconName === null ? undefined : h(P[wmIconName], { size: 16 })
+        icon: WmFolderIcon === null ? undefined : React.createElement(WmFolderIcon, { size: 16 })
       }],
       handleWorkspaceMenu: (id, row) => {
         if (id !== "dsm-wm-migrate-workspace") return false;

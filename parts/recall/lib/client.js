@@ -13,8 +13,33 @@ window.__ModuleLoader__.load({
     // 官方 ui-attachment 的图片放大预览正是用 react-dom 的 createPortal 挂到 body。
     var ReactDOM = require("react-dom");
     var Primitives = require("@deepseek-ai/dsh-client-ui-primitives");
-    var IconRefreshOutline16 = Primitives.IconRefreshOutline16;
-    var IconCloseOutline16 = Primitives.IconCloseOutline16;
+    /**
+     * 图标解析：DSH 的图标命名换过代，这里两代都认。
+     *   旧版（≤ 0.1.5-rc.x）：尺寸写在后缀里 —— IconRefreshOutline16
+     *   新版（2.0.x 起）    ：风格写在后缀里 —— IconRefreshOutlineRegular + { size }
+     * 解析不到返回 null。**绝不返回 undefined**：React 碰到 undefined 组件会抛
+     * "Element type is invalid"，整个 slot 的渲染会一起失败。
+     */
+    function resolvePrimitiveIcon(base, legacySize) {
+      var names = [base + "Regular", base + "Medium", base, base + "Artwork"];
+      if (typeof legacySize === "string") names.push(base + legacySize);
+      for (var i = 0; i < names.length; i += 1) {
+        var found = Primitives === null || Primitives === undefined ? undefined : Primitives[names[i]];
+        if (typeof found === "function") return found;
+        if (found !== null && found !== undefined && typeof found === "object") return found;
+      }
+      return null;
+    }
+    /** 渲染图标；解析不到就渲染 null，而不是让 React 崩掉整个 slot。 */
+    function renderPrimitiveIcon(node, props) {
+      return node === null ? null : React.createElement(node, props === undefined ? null : props);
+    }
+    var IconRefreshOutline = resolvePrimitiveIcon("IconRefreshOutline", "16");
+    var IconCloseOutline = resolvePrimitiveIcon("IconCloseOutline", "16");
+    var IconCheckOutline = resolvePrimitiveIcon("IconCheckOutline", "16");
+    var IconCopyOutline = resolvePrimitiveIcon("IconCopyOutline", "16");
+    var IconChevronLeftOutline = resolvePrimitiveIcon("IconChevronLeftOutline", "14");
+    var IconChevronRightOutline = resolvePrimitiveIcon("IconChevronRightOutline", "14");
 
 
     /** 统一日志：默认静默（仅上报 host 落盘）；调试模式（localStorage dsh-message-recall:debug=1）时打印控制台。 */
@@ -898,7 +923,7 @@ window.__ModuleLoader__.load({
                 cursor: "pointer"
               }
             },
-            React.createElement(IconCloseOutline16, { size: 16 })
+            renderPrimitiveIcon(IconCloseOutline, { size: 16 })
           )
         ),
         document.body
@@ -1231,7 +1256,7 @@ window.__ModuleLoader__.load({
             "aria-checked": !!value,
             style: checkStyle,
             onClick: function (e) { e.stopPropagation(); onChange(!value); }
-          }, value ? React.createElement(Primitives.IconCheckOutline16, null) : null)
+          }, value ? renderPrimitiveIcon(IconCheckOutline, null) : null)
         );
       }
 
@@ -1704,7 +1729,7 @@ window.__ModuleLoader__.load({
           disabled: atFirst,
           "aria-label": TEXT.pagerPrev,
           onClick: function () { go(-1); }
-        }, React.createElement(Primitives.IconChevronLeftOutline14, null)),
+        }, renderPrimitiveIcon(IconChevronLeftOutline, null)),
         React.createElement("span", { style: { padding: "0 4px", fontSize: "14px", whiteSpace: "nowrap" } }, (index + 1) + "/" + count),
         React.createElement("button", {
           type: "button",
@@ -1713,7 +1738,7 @@ window.__ModuleLoader__.load({
           disabled: atLast,
           "aria-label": TEXT.pagerNext,
           onClick: function () { go(1); }
-        }, React.createElement(Primitives.IconChevronRightOutline14, null))
+        }, renderPrimitiveIcon(IconChevronRightOutline, null))
       );
     }
 
@@ -2292,8 +2317,8 @@ window.__ModuleLoader__.load({
         onMouseLeave: function (e) { e.currentTarget.style.background = "transparent"; },
         onClick: function (e) { e.stopPropagation(); copy(); }
       }, copied
-        ? React.createElement(Primitives.IconCheckOutline16, { size: 14 })
-        : React.createElement(Primitives.IconCopyOutline16, { size: 14 }));
+        ? renderPrimitiveIcon(IconCheckOutline, { size: 14 })
+        : renderPrimitiveIcon(IconCopyOutline, { size: 14 }));
     }
 
     /** clipboard API 不可用时的回退复制。 */
@@ -3323,7 +3348,7 @@ addToComposer(props.inputActions, bIds);
               e.stopPropagation();
               // 编辑态下的撤回键 = 放弃本次编辑（等同于取消，零副作用）
               cancelEdit();
-            }, React.createElement(IconRefreshOutline16, { size: 16 }), "recall-key")
+            }, renderPrimitiveIcon(IconRefreshOutline, { size: 16 }), "recall-key")
           ),
           // 原图预览：与底部草稿栏同一交互（点缩略图开、Escape/遮罩/关闭键关）
           lightboxSrc ? React.createElement(ImageLightbox, {
@@ -3371,7 +3396,7 @@ React.createElement(
                 // 纯本地动作：不写 pending、不动输入框，点多少次都无副作用；
                 // 真正的截断重发只发生在编辑器里的「确认」。
                 enterEdit();
-              }, React.createElement(IconRefreshOutline16, { size: 16 }), "recall-key"),
+              }, renderPrimitiveIcon(IconRefreshOutline, { size: 16 }), "recall-key"),
               React.createElement(CopyButton, { text: text })
             )
       );

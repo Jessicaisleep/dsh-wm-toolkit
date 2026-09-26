@@ -4,6 +4,51 @@
 半边各自的详细变更史保留在 `parts/recall/CHANGELOG-WM.md` 与 `parts/manager/CHANGELOG.md`；
 本文件只记录**面向使用者**的包级版本。
 
+## 0.2.6 — 2026-09-26
+
+### 修：DSH 2.0 更新后，左下角「会话管理」整块消失
+
+**现象**：DSH 桌面端从 `0.1.5-rc.x` 更新到 `2.0.15` 之后，侧边栏左下角（设置上方）的
+**「会话管理」席位不见了**。而其他一切正常 —— 会话顶栏的归档/移动/删除在、用户消息行的
+撤回/编辑/复制/删除在、助手回复的删除也在。
+
+**根因**：DSH 2.0 换了官方 primitives 的**图标命名规则**：
+
+| | 命名 | 尺寸 |
+|---|---|---|
+| 旧版（≤ 0.1.5-rc.x） | `IconArchiveOutline20` | 写在名字后缀里 |
+| 新版（2.0.x 起） | `IconArchiveOutlineRegular` | 作为 `{ size }` prop |
+
+`FooterAction` 里渲染的是 `h(P.IconArchiveOutline20, { size: 14 })`，在新版下 `P.IconArchiveOutline20`
+是 **`undefined`** → React 抛 `Element type is invalid` → **整个 `sidebar.footer.action` 席位渲染失败**。
+
+这解释了为什么"只消失了这一个"：
+
+- 顶栏的 `HeaderAction` 只渲染**纯文字按钮**，不用图标组件 → 不受影响；
+- `parts/recall` 与 `parts/delete` 的行内按钮用的是**内联 SVG**（`innerHTML`），不走 primitives → 不受影响；
+- 只有左下角那个席位渲染了 primitives 图标 → 只有它崩。
+
+**修法**：
+
+1. 新增 **跨版本图标解析器** `resolvePrimitiveIcon(base, legacySize)`：按
+   `<基名>Regular` → `<基名>Medium` → `<基名>` → `<基名>Artwork` → `<基名><旧尺寸>`
+   的顺序取第一个存在的组件；**解析不到返回 `null`，绝不返回 `undefined`**。
+2. 新增 `renderPrimitiveIcon(node, props)`：解析不到时渲染 `null`（即"没有图标"），
+   而不是让 React 崩掉整个席位 —— **图标缺失不该带崩一个功能入口**。
+3. recall / manager 两个半边里所有 primitives 图标都改走解析器；工作区菜单项的图标候选表
+   也从旧名字换成了新名字。
+4. 顺带修掉一个同类隐患：`FooterAction`、顶栏 `HeaderAction` 之外，凡是直接 `P.某名字`
+   取值的地方都改成了解析器（以后再改名只会"少一个图标"，不会"少一个入口"）。
+
+### 测试
+
+- 新增 `parts/manager/tests/icon-compat.test.mjs`（12 项）：
+  - **行为层**：用「只有新版名」「只有旧版名」「两个都没有」三种 primitives 分别加载**真实半边**，
+    断言渲染树里**绝不出现 `undefined` 组件类型**（那正是崩溃条件），并验证三种情况各自的降级表现；
+  - **源码层**：断言三个客户端半边里不再出现"尺寸后缀"的老式图标名（注释除外），
+    且图标必须经过解析器（禁止 `h(P.Icon…)` / `React.createElement(Icon…)` 直取）。
+- 汇总从 11 套增至 **12 套**。
+
 ## 0.2.5 — 2026-09-24
 
 ### 修：最新发出的消息 / 刚完成的回复没有删除按钮，必须重启 DSH 才出现
