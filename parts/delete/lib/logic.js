@@ -17,6 +17,21 @@
 export const PLUGIN_ID = 'dsh-wm-toolkit';
 
 /**
+ * 构造写进替换事件的 source。
+ *
+ * 会话格式 v4 起，插件 source 必须是「生产者自己的 kind」，即 `{ kind: 'plugin:<完整插件名>' }`；
+ * v3 时代的 `{ kind: 'plugin', plugin: X }` 包装已被 v4 写入守卫拒绝
+ * （`assertV4RowAdmission` → `format v4 message requires a producer-owned source kind`），
+ * 一旦写出就会让整个 turn 在 step 0 失败。这里统一从这里取 source，避免读写两侧再次漂移。
+ *
+ * @param id - 插件标识，默认本插件。
+ * @returns v4 规范的 source 对象。
+ */
+export function pluginSource(id = PLUGIN_ID) {
+  return { kind: `plugin:${id}` };
+}
+
+/**
  * 上游插件 `dsh-delete-turn` 的标识。
  *
  * 如果这台机器上曾经装过它、并留下过删除记录，那些替换事件在日志里依然是有效的
@@ -92,9 +107,9 @@ export function messageIdOf(event) {
 /**
  * 某个消息 source 是否属于本插件（或上游删除插件）。
  *
- * 两种形状都要认：本机 DSH 0.1.5-rc.2 的日志里是 `{ kind: 'plugin', plugin: X }`
- * （见真实日志中 system/message 的 source）；DSH 0.1.7 的会话格式 v4 规范化会把
- * 插件 source 展平为 `{ kind: 'plugin:X' }`。日志升级前后都要能重建台账。
+ * 两种形状都要认：v3 及更早的日志里是 `{ kind: 'plugin', plugin: X }`（退役包装），
+ * v4 会话格式规范化后是 `{ kind: 'plugin:X' }`（当前写法，见 {@link pluginSource}）。
+ * 本机两种历史日志都要能重建台账，所以读侧同时接受，写侧只写 v4 形状。
  *
  * @param source - 日志事件里的消息 source 对象。
  * @returns 属于本插件或上游删除插件时返回 true。
@@ -111,8 +126,8 @@ export function sourceOwnsPlugin(source) {
 /**
  * 只靠日志重建本插件的删除台账。
  *
- * 每一次删除都是一个替换事件，其消息 source 为 `{ kind: 'plugin', plugin: 'dsh-wm-toolkit' }`
- * （v3）或 `{ kind: 'plugin:dsh-wm-toolkit' }`（v4）。模式由被遮蔽的窗口反推：
+ * 每一次删除都是一个替换事件，其消息 source 为 `{ kind: 'plugin:dsh-wm-toolkit' }`
+ * （v4 当前写法）或 `{ kind: 'plugin', plugin: 'dsh-wm-toolkit' }`（v3 历史日志）。模式由被遮蔽的窗口反推：
  * 单条用户消息 = 单条删除；同一个 turn+step 的 assistant/tool 节点 = 步骤删除；
  * 更宽的就是整条回复删除。别的生产者（例如官方 /compact）落下的替换一律忽略。
  *

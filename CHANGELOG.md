@@ -4,6 +4,52 @@
 半边各自的详细变更史保留在 `parts/recall/CHANGELOG-WM.md` 与 `parts/manager/CHANGELOG.md`；
 本文件只记录**面向使用者**的包级版本。
 
+## 0.2.7 — 2026-09-26
+
+### 修：删除消息写出退役的 v3 source，整个 turn 在 step 0 失败（DSH v4 格式适配）
+
+**现象**：用过「删除消息」之后，该会话再也没法继续——之后每一次发消息都立刻失败，
+而且**失败在 `step 0`**（还没开始跑就挂了），宿主机日志刷：
+
+```
+agent turn failed (session session-..., turn 17, step 0): format v4 message requires a producer-owned source kind
+    at source (dsh-session-format-v3-to-v4/lib/index.js:126)
+    at assertV4SourceRowAdmission (...:150)
+    at assertV4RowAdmission (...:1112)
+    at Object.encodeEvent (...:1097)
+    at eventLine (dsh-session-persistence-jsonl/lib/index.js:955)
+    at Proxy.encodeEventBatch (...:3196)
+    at Proxy.appendLines (...:3216)
+```
+
+会话投影缓存也一直写不进去（`session projection cache: ... failed (cache stays stale)`），
+于是界面里会话列表/预览不再更新。用户观感就是「这个对话打不开了」。
+
+**根因**：删除半边追加替换事件时，source 仍按 v3 时代写：
+
+```js
+source: { kind: 'plugin', plugin: PLUGIN_ID },   // parts/delete/lib/index.js
+```
+
+而会话格式 v4 要求「生产者自己的 kind」，即 `{ kind: 'plugin:<完整插件名>' }`；
+v4 行接纳守卫（`source()`）明确拒绝 `kind === 'plugin'` 的退役包装。
+
+**注意这是写入路径出错，不是存储损坏**：坏事件被守卫拦下，**从未落盘**，
+所以会话日志本身是干净的（实测 v4 日志 3780 行可 100% 读回）。
+但只要有事件要写就整个 turn 崩掉，看起来就像「对话坏了」。
+排查时别去修会话文件——文件没问题。
+
+**修复**：
+
+| 位置 | 改动 |
+|---|---|
+| `parts/delete/lib/logic.js` | 新增 `pluginSource()`，统一产出 v4 规范 source |
+| `parts/delete/lib/index.js` | 写入点改用 `pluginSource()` |
+| `parts/delete/tests/wm-delete-host.test.mjs` | 断言改为 v4 形状；新增回归测试：用**官方 v4 守卫**验收写出的事件，并确认旧写法会被拒 |
+
+读侧**不变**：`sourceOwnsPlugin` 依旧同时认 `{ kind:'plugin', plugin:X }`（v3 历史日志）
+与 `{ kind:'plugin:X' }`（v4），历史删除台账照常重建。
+
 ## 0.2.6 — 2026-09-26
 
 ### 修：DSH 2.0 更新后，左下角「会话管理」整块消失
