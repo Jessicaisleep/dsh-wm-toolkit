@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import {
   PLUGIN_ID,
   PlanError,
+  clearedReplyTurns,
   deletableReplyTurns,
   foldSurface,
   hiddenEntries,
@@ -18,6 +19,7 @@ import {
   isBusy,
   isOwnPlaceholder,
   planRange,
+  replySegments,
   sourceOwnsPlugin,
   turnIndex,
 } from '../lib/logic.js';
@@ -67,8 +69,37 @@ function buildLog() {
   return events;
 }
 
-/** 在日志尾部追加一条"本插件删除"替换事件，返回新日志与遮蔽的 seq。 */
-function withDeletion(events, startSeq, endSeq) {
+/**
+ * 造一份"一个回合里中途插了一次话"的日志——就是线上事故的形态：
+ * 提问 u1 → 助手 a1 + 工具 t1 → 插话 u2（真人第二条提问）→ 助手 a2。
+ * surface 节点顺序：system(1) → u1(2) → a1(4) → t1(6) → u2(10) → a2(11)
+ */
+function buildSteeringLog() {
+  const events = [];
+  const push = (type, data, surfaceOp) => {
+    const event = { type, seq: events.length, time: 1000 + events.length, data };
+    if (surfaceOp !== undefined) event.surfaceOp = surfaceOp;
+    events.push(event);
+    return event;
+  };
+  push('turn/start', { turn: 1 });
+  push('system/message', { message: { id: 'sys', role: 'system', content: [{ type: 'text', text: 'system' }] } }, 'append');
+  push('user/message', { id: 'u1', role: 'user', content: [{ type: 'text', text: 'A' }], source: userSource('r1') }, 'append');
+  push('step/start', { turn: 1, step: 1 });
+  push('assistant/message', { turn: 1, step: 1, message: assistantMsg('a1', 1, 1) }, 'append');
+  push('tool/call', { turn: 1, step: 1, callId: 'c1', name: 'pwsh' });
+  push('tool/result', { turn: 1, step: 1, message: toolMsg('t1', 1, 1) }, 'append');
+  push('step/end', { turn: 1, step: 1 });
+  push('agent/inbox/spliced', { target: 'next-step', start: 0, removedCount: 0, inserted: [{ id: 'u2', source: userSource('r2') }] });
+  push('step/start', { turn: 1, step: 2 });
+  push('user/message', { id: 'u2', role: 'user', content: [{ type: 'text', text: 'B' }], source: userSource('r2') }, 'append');
+  push('assistant/message', { turn: 1, step: 2, message: assistantMsg('a2', 1, 2) }, 'append');
+  push('step/end', { turn: 1, step: 2 });
+  push('turn/end', { turn: 1 });
+  return events;
+}
+
+/** 在日志尾部追加一条"本插件删除"替换事件，返回新日志与遮蔽的 seq。 */function withDeletion(events, startSeq, endSeq) {
   const folded = foldSurface(events);
   const startIdx = folded.nodes.indexOf(startSeq);
   const endIdx = folded.nodes.indexOf(endSeq);
@@ -188,6 +219,78 @@ test('mode=reply 绝不把系统提示词头卷进窗口', () => {
   const nodes = foldSurface(log).nodes;
   const plan = planRange(log, nodes, { mode: 'reply', turn: 1 });
   assert.ok(!plan.shadowed.includes(2), '系统提示词头不应出现在遮蔽集合里');
+});
+
+test('mode=reply 默认只删被点的那一段（方案二：不误伤插话之前的回复）', () => {
+  // 线上事故：一次「删除这条回复」把整轮四段全删了。默认必须是"只删我点的这一段"。
+  const log = buildSteeringLog();
+  const nodes = foldSurface(log).nodes;
+  assert.deepEqual(nodes, [1, 2, 4, 6, 10, 11]);
+  // 点插话之后那一段的段尾助手消息 → 只删它
+  const last = planRange(log, nodes, { mode: 'reply', seq: 11 });
+  assert.equal(last.scope, 'segment');
+  assert.equal(last.segmentCount, 2);
+  assert.deepEqual(last.shadowed, [11]);
+  assert.deepEqual(last.windows.map((window) => window.shadowed), [[11]]);
+  // 点插话之前那一段的助手消息 → 也只删它（这一段同样有自己的入口）
+  const first = planRange(log, nodes, { mode: 'reply', seq: 4 });
+  assert.deepEqual(first.shadowed, [4, 6], '该段的助手消息 + 工具结果一起走');
+  assert.ok(!first.shadowed.includes(11), '不得碰到插话之后的段');
+  assert.ok(!first.shadowed.includes(2) && !first.shadowed.includes(10), '两条提问都保留');
+});
+
+test('mode=reply + scope=turn 才删整轮（方案一：留 A 与中途补发的 C）', () => {
+  const log = buildSteeringLog();
+  const nodes = foldSurface(log).nodes;
+  const plan = planRange(log, nodes, { mode: 'reply', turn: 1, scope: 'turn' });
+  assert.equal(plan.scope, 'turn');
+  assert.deepEqual(plan.windows.map((window) => window.shadowed), [[4, 6], [11]]);
+  assert.deepEqual(plan.shadowed, [4, 6, 11]);
+  assert.equal(plan.startSeq, 4);
+  assert.equal(plan.endSeq, 11);
+  assert.ok(!plan.shadowed.includes(2), '回合开场提问必须保留');
+  assert.ok(!plan.shadowed.includes(10), '回合中途插进来的追问也必须保留');
+});
+
+test('replySegments 报出每段的范围与段尾助手消息（浏览器半边据此挂按钮）', () => {
+  const log = buildSteeringLog();
+  const segments = replySegments(log, foldSurface(log).nodes, 1);
+  assert.equal(segments.length, 2);
+  assert.deepEqual(segments.map((segment) => segment.shadowed), [[4, 6], [11]]);
+  // 段尾常常是工具结果，但按钮只能挂在助手行上，所以要报 assistantSeqs 的最后一个
+  assert.deepEqual(segments.map((segment) => segment.assistantSeqs), [[4], [11]]);
+  assert.ok(segments.every((segment) => segment.clean));
+});
+
+test('mode=reply 对已经离开 surface 的目标：默认报 already-deleted，勾了整轮才能清', () => {
+  const log = buildSteeringLog();
+  // 先删掉插话之后的那一截（= 旧实现"删除这条回复"删掉的东西）
+  const first = withDeletion(log, 11, 11);
+  const nodes = foldSurface(first.events).nodes;
+  // 默认 scope=segment：那一段已经没了 → 明确报 already-deleted，绝不顺势扩大范围
+  assert.throws(() => planRange(first.events, nodes, { mode: 'reply', messageId: 'a2' }), (error) => {
+    assert.ok(error instanceof PlanError);
+    assert.equal(error.code, 'already-deleted');
+    return true;
+  });
+  // 显式勾选整轮：把回合里剩下的残块一次清掉（历史残留的收尾路径）
+  const plan = planRange(first.events, nodes, { mode: 'reply', turn: 1, scope: 'turn' });
+  assert.deepEqual(plan.shadowed, [4, 6]);
+  assert.equal(plan.windows.length, 1);
+});
+
+test('mode=reply 在该回合已经没有回复内容时返回 nothing-to-delete', () => {
+  const log = buildSteeringLog();
+  const first = withDeletion(log, 4, 6);
+  const second = withDeletion(first.events, 11, 11);
+  const nodes = foldSurface(second.events).nodes;
+  assert.ok(nodes.includes(2) && nodes.includes(10), '两条真人提问都该留在 surface 上');
+  assert.ok(!nodes.includes(4) && !nodes.includes(6) && !nodes.includes(11), '回复内容已全部离开 surface');
+  assert.throws(() => planRange(second.events, nodes, { mode: 'reply', turn: 1 }), (error) => {
+    assert.ok(error instanceof PlanError);
+    assert.equal(error.code, 'nothing-to-delete');
+    return true;
+  });
 });
 
 // ---------------------------------------------------------------- 规划：按步骤
@@ -357,6 +460,35 @@ test('deletableReplyTurns 只报还有回复内容的回合', () => {
   const { events } = withDeletion(log, 4, 8);
   const nodes2 = foldSurface(events).nodes;
   assert.deepEqual(deletableReplyTurns(events, nodes2), [2]);
+});
+
+test('deletableReplyTurns 与新的 reply 语义对齐：只剩插话之前的残块也算可删', () => {
+  const log = buildSteeringLog();
+  const nodes = foldSurface(log).nodes;
+  assert.deepEqual(deletableReplyTurns(log, nodes), [1]);
+  // 删掉插话之后那一截：回合里还有残块（旧实现会把这一轮判成"没得删"，界面上入口消失）
+  const { events } = withDeletion(log, 11, 11);
+  const nodes2 = foldSurface(events).nodes;
+  assert.deepEqual(deletableReplyTurns(events, nodes2), [1]);
+  // 两截都删完（只剩提问）才不再报
+  const second = withDeletion(events, 4, 6);
+  assert.deepEqual(deletableReplyTurns(second.events, foldSurface(second.events).nodes), []);
+});
+
+test('clearedReplyTurns：只有"被删过且已无任何回复内容"的回合才算删空', () => {
+  const log = buildSteeringLog();
+  assert.deepEqual(clearedReplyTurns(log, foldSurface(log).nodes, new Set()), [], '没删过任何东西时什么都不报');
+
+  // 只删掉插话之后那一截 → 回合里还有残块（4/6）→ 不算删空
+  const first = withDeletion(log, 11, 11);
+  const nodes1 = foldSurface(first.events).nodes;
+  assert.deepEqual(clearedReplyTurns(first.events, nodes1, new Set([11])), []);
+
+  // 两截都删完 → 回合 1 被删空（两条提问还在 surface 上）
+  const second = withDeletion(first.events, 4, 6);
+  const nodes2 = foldSurface(second.events).nodes;
+  assert.deepEqual(nodes2.includes(2), true);
+  assert.deepEqual(clearedReplyTurns(second.events, nodes2, new Set([11, 4, 6])), [1]);
 });
 
 // ---------------------------------------------------------------- turnIndex

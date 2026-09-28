@@ -27,7 +27,18 @@ import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import { PLUGIN_ID, PlanError, deletableReplyTurns, foldSurface, hiddenEntriesOfFold, isBusy, planRange, pluginSource } from './logic.js';
+import {
+  PLUGIN_ID,
+  PlanError,
+  clearedReplyTurns,
+  deletableReplyTurns,
+  foldSurface,
+  hiddenEntriesOfFold,
+  isBusy,
+  planRange,
+  pluginSource,
+  replySegments,
+} from './logic.js';
 
 export const name = 'dsh-wm-delete';
 
@@ -199,12 +210,31 @@ async function stateOf(ctx, sessionId) {
   const events = await readEvents(ctx, sessionId);
   if (!events) throw new HttpError(404, 'session-not-found', 'no session log for this id');
   const folded = foldSurface(events);
+  const hidden = hiddenEntriesOfFold(folded, events);
+  const replyTurns = deletableReplyTurns(events, folded.nodes);
+  // 每个可删回合被真人提问切成了几段回复（指令A→回复B→中途补发指令C→回复D 就是 2 段）。
+  // 浏览器半边据此在确认框里给出「同时删掉这一轮其它回复段」的选项；只有 1 段的回合不必问。
+  const segmentsByTurn = {};
+  // 每一段的**段尾节点**（该段最后一个 assistant/message 的 seq）：浏览器半边只在段尾那一行
+  // 挂「删除这段回复」按钮——每段恰好一个入口，段中间的行不重复长按钮。
+  const segmentTails = [];
+  for (const turn of replyTurns) {
+    const segments = replySegments(events, folded.nodes, turn);
+    if (segments.length === 0) continue;
+    segmentsByTurn[turn] = segments.length;
+    for (const segment of segments) segmentTails.push(segment.assistantSeqs[segment.assistantSeqs.length - 1] ?? segment.endSeq);
+  }
   return {
-    hidden: hiddenEntriesOfFold(folded, events),
+    hidden,
     // 当前 surface 让浏览器半边能区分「还带着上下文内容的行」与「已被官方压缩移出上下文的行」；
     // replyTurns 再把范围收窄到「确实还有可删回复」的回合。
     surface: folded.nodes,
-    replyTurns: deletableReplyTurns(events, folded.nodes),
+    replyTurns,
+    segmentsByTurn,
+    segmentTails,
+    // clearedTurns：已经被删空、只剩提问的回合。这些回合里"映射不到 surface 节点"的行
+    // （过程分组壳、重试行、中断的工具行）必须按回合号整行收起，否则就是一堆删不掉的壳。
+    clearedTurns: clearedReplyTurns(events, folded.nodes, new Set(hidden.map((entry) => entry.seq))),
     live: Boolean(findLiveSession(ctx, sessionId)),
     busy: isBusy(events),
     lastSeq: events.length > 0 ? events[events.length - 1].seq : -1,
@@ -230,6 +260,8 @@ async function deleteTarget(ctx, sessionId, body) {
       seq: typeof body.seq === 'number' ? body.seq : undefined,
       messageId: typeof body.messageId === 'string' ? body.messageId : undefined,
       turn: typeof body.turn === 'number' ? body.turn : undefined,
+      // scope 只对 reply 有效：'segment'（默认）只删被点的那一段，'turn' 删整轮。
+      scope: body.scope === 'turn' ? 'turn' : 'segment',
     });
   } catch (error) {
     if (error instanceof PlanError) {
@@ -240,43 +272,84 @@ async function deleteTarget(ctx, sessionId, body) {
   }
 
   // live surface 才是追加的权威；读到这里之间节点消失，说明别的写入者抢先落地了。
-  for (const seq of plan.shadowed) {
-    if (!surfaceNodes.includes(seq)) throw new HttpError(409, 'stale', 'the session changed, retry');
+  // reply 模式允许**目标**已经离场（按回合清理残块），但被遮蔽的节点一个都不能少。
+  // 多段窗口（回合中途有插话）时逐段校验，任何一段不干净就整单拒绝，不留半成品。
+  const windows = Array.isArray(plan.windows) && plan.windows.length > 0
+    ? plan.windows
+    : [{ startSeq: plan.startSeq, endSeq: plan.endSeq, shadowed: plan.shadowed }];
+  for (const window of windows) {
+    for (const seq of window.shadowed) {
+      if (!surfaceNodes.includes(seq)) throw new HttpError(409, 'stale', 'the session changed, retry');
+    }
   }
 
-  let replacement;
-  try {
-    replacement = session.append(
-      'user/message',
-      {
-        id: randomUUID(),
-        role: 'user',
-        content: [{ type: 'text', text: '[deleted]' }],
-        source: pluginSource(),
-      },
-      {
-        surfaceOp: { op: 'replace', startSeq: plan.startSeq, endSeq: plan.endSeq },
-        sourceEventSeqs: plan.shadowed,
-      },
-    );
-  } catch (error) {
-    throw new HttpError(409, 'stale', `the surface refused the replacement: ${String((error && error.message) || error)}`);
+  const hidden = [];
+  const refusals = [];
+  const landed = [];
+  for (const [index, window] of windows.entries()) {
+    let appended;
+    try {
+      appended = session.append(
+        'user/message',
+        {
+          id: randomUUID(),
+          role: 'user',
+          content: [{ type: 'text', text: '[deleted]' }],
+          source: pluginSource(),
+        },
+        {
+          surfaceOp: { op: 'replace', startSeq: window.startSeq, endSeq: window.endSeq },
+          sourceEventSeqs: window.shadowed,
+        },
+      );
+    } catch (error) {
+      // 前几段可能已经落地（那是**真的**删掉了），所以这里不整单失败：记下来，
+      // 把已落地的台账照样回报给客户端，剩下的段刷新后可以再删一次。
+      const detail = String((error && error.message) || error);
+      refusals.push(`window ${index + 1}: ${detail}`);
+      logLine('warn', '删除窗口被 surface 拒绝', {
+        sessionId,
+        mode: plan.mode,
+        window: `${index + 1}/${windows.length}`,
+        startSeq: window.startSeq,
+        endSeq: window.endSeq,
+        err: detail,
+      });
+      continue;
+    }
+    landed.push({ window, position: index + 1, replacementSeq: appended && appended.seq });
+    hidden.push(...window.shadowed.map((seq) => ({ seq, mode: plan.mode })));
+  }
+  if (hidden.length === 0) {
+    throw new HttpError(409, 'stale', `the surface refused the replacement: ${refusals.join(' | ')}`);
   }
   const flush = await flushSession(ctx, session);
-  logLine('info', '删除已落地', {
-    sessionId,
-    mode: plan.mode,
-    startSeq: plan.startSeq,
-    endSeq: plan.endSeq,
-    shadowed: plan.shadowed,
-    replacementSeq: replacement && replacement.seq,
-    flushed: flush.flushed,
-  });
+  for (const entry of landed) {
+    logLine('info', '删除已落地', {
+      sessionId,
+      mode: plan.mode,
+      window: windows.length > 1 ? `${entry.position}/${windows.length}` : null,
+      startSeq: entry.window.startSeq,
+      endSeq: entry.window.endSeq,
+      shadowed: entry.window.shadowed,
+      replacementSeq: entry.replacementSeq,
+      flushed: flush.flushed,
+    });
+  }
+
+  // 删除已经落地：用 live 快照立刻重算「已删空的回合」，浏览器半边当场就能把过程壳行
+  // （分组标题行、模型重试行）一并收起，不必等 800ms 的防抖刷新。
+  const after = eventsFromLive(session) ?? events;
+  const afterFolded = foldSurface(after);
+  const afterHidden = hiddenEntriesOfFold(afterFolded, after);
+  const clearedTurns = clearedReplyTurns(after, afterFolded.nodes, new Set(afterHidden.map((entry) => entry.seq)));
 
   return {
-    replacementSeq: replacement && replacement.seq,
+    replacementSeq: landed[landed.length - 1].replacementSeq,
     ...flush,
-    hidden: plan.shadowed.map((seq) => ({ seq, mode: plan.mode })),
+    partial: refusals.length > 0,
+    hidden,
+    clearedTurns,
   };
 }
 

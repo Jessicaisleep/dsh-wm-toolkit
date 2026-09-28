@@ -67,6 +67,36 @@ function buildLog() {
   return events;
 }
 
+/**
+ * 一个回合里中途插了一次话的日志（线上事故同形）：
+ * 提问 u1 → a1 + 工具 t1 → 插话 u2 → a2。
+ * surface 节点顺序：system(1) → u1(2) → a1(4) → t1(6) → u2(10) → a2(11)
+ */
+function buildSteeringLog() {
+  const events = [];
+  const push = (type, data, surfaceOp) => {
+    const event = { type, seq: events.length, time: 1000 + events.length, data };
+    if (surfaceOp !== undefined) event.surfaceOp = surfaceOp;
+    events.push(event);
+    return event;
+  };
+  push('turn/start', { turn: 1 });
+  push('system/message', { message: { id: 'sys', role: 'system', content: [{ type: 'text', text: 'system' }] } }, 'append');
+  push('user/message', { id: 'u1', role: 'user', content: [{ type: 'text', text: 'A' }], source: userSource('r1') }, 'append');
+  push('step/start', { turn: 1, step: 1 });
+  push('assistant/message', { turn: 1, step: 1, message: { id: 'a1', role: 'assistant', content: [{ type: 'text', text: 'B' }] } }, 'append');
+  push('tool/call', { turn: 1, step: 1, callId: 'c1', name: 'pwsh' });
+  push('tool/result', { turn: 1, step: 1, message: { id: 't1', role: 'tool', content: [{ type: 'tool-result', content: 'ok' }] } }, 'append');
+  push('step/end', { turn: 1, step: 1 });
+  push('agent/inbox/spliced', { target: 'next-step', start: 0, removedCount: 0, inserted: [{ id: 'u2', source: userSource('r2') }] });
+  push('step/start', { turn: 1, step: 2 });
+  push('user/message', { id: 'u2', role: 'user', content: [{ type: 'text', text: 'C' }], source: userSource('r2') }, 'append');
+  push('assistant/message', { turn: 1, step: 2, message: { id: 'a2', role: 'assistant', content: [{ type: 'text', text: 'D' }] } }, 'append');
+  push('step/end', { turn: 1, step: 2 });
+  push('turn/end', { turn: 1 });
+  return events;
+}
+
 // ---------------------------------------------------------------- 假宿主
 
 function makeHarness(log, options = {}) {
@@ -367,6 +397,74 @@ await check('dispose 撤掉两条路由', () => {
   assert.equal(h.routes.size, 0);
 });
 
+// ---------------------------------------------------------------- 回合中途插话（回归：删多 / 删不干净）
+
+// 默认行为：只删被点的那一段（方案二）。
+const segmentHarness = makeHarness(buildSteeringLog());
+
+await check('回合中途插话：默认只删被点的那一段，另一段与两条提问都保留', async () => {
+  const res = await segmentHarness.request({
+    method: 'POST',
+    path: '/wm-delete/delete',
+    headers: { 'content-type': 'application/json' },
+    // 点插话之后那一段的段尾助手消息（seq 11）
+    body: JSON.stringify({ sessionId: SESSION_ID, mode: 'reply', seq: 11, turn: 1 }),
+  });
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.ok, true);
+  assert.deepEqual(res.body.hidden, [{ seq: 11, mode: 'reply' }]);
+  assert.equal(segmentHarness.appended.length, 1, '只该追加一条替换事件');
+  assert.deepEqual(segmentHarness.appended[0].surfaceOp, { op: 'replace', startSeq: 11, endSeq: 11 });
+  assert.deepEqual(segmentHarness.appended[0].sourceEventSeqs, [11]);
+  // 插话之前那一段（4、6）必须还在 surface 上——这正是"删多了"的反面
+  const state = await segmentHarness.request({ path: `/wm-delete/state?sessionId=${SESSION_ID}` });
+  assert.equal(state.statusCode, 200);
+  for (const seq of [4, 6, 2, 10]) assert.ok(state.body.surface.includes(seq), `seq ${seq} 不应被删`);
+  assert.equal(state.body.segmentsByTurn['1'], 1, '删完一段后这一轮还剩 1 段');
+  assert.deepEqual(state.body.segmentTails, [4], '剩下那一段的段尾是助手消息 4（不是工具结果 6）');
+});
+
+// 显式勾选整轮：一次把两段都删（方案一）。
+const wholeTurnHarness = makeHarness(buildSteeringLog());
+
+await check('回合中途插话：scope=turn 才一次追加两段替换，两条提问都保留', async () => {
+  const res = await wholeTurnHarness.request({
+    method: 'POST',
+    path: '/wm-delete/delete',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ sessionId: SESSION_ID, mode: 'reply', turn: 1, scope: 'turn' }),
+  });
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.ok, true);
+  assert.notEqual(res.body.partial, true);
+  assert.deepEqual(res.body.hidden, [
+    { seq: 4, mode: 'reply' },
+    { seq: 6, mode: 'reply' },
+    { seq: 11, mode: 'reply' },
+  ]);
+  assert.equal(wholeTurnHarness.appended.length, 2, '两段窗口应各追加一条替换事件');
+  assert.deepEqual(
+    wholeTurnHarness.appended.map((event) => event.surfaceOp),
+    [{ op: 'replace', startSeq: 4, endSeq: 6 }, { op: 'replace', startSeq: 11, endSeq: 11 }],
+  );
+  assert.deepEqual(wholeTurnHarness.appended.map((event) => event.sourceEventSeqs), [[4, 6], [11]]);
+  assert.deepEqual(
+    wholeTurnHarness.appended.map((event) => event.data.source),
+    [{ kind: `plugin:${PLUGIN_ID}` }, { kind: `plugin:${PLUGIN_ID}` }],
+  );
+  // 删除响应当场回报"已经被删空的回合"，让浏览器半边把过程分组壳/重试行一并收起
+  assert.deepEqual(res.body.clearedTurns, [1], '回合 1 已删空（只剩两条提问）');
+});
+
+await check('回合中途插话：整轮删除后两条提问仍在 surface 上，回复内容全部离场', async () => {
+  const res = await wholeTurnHarness.request({ path: `/wm-delete/state?sessionId=${SESSION_ID}` });
+  assert.equal(res.statusCode, 200);
+  assert.ok(res.body.surface.includes(2) && res.body.surface.includes(10), '真人提问必须保留');
+  for (const seq of [4, 6, 11]) assert.ok(!res.body.surface.includes(seq), `seq ${seq} 应离开 surface`);
+  assert.deepEqual(res.body.replyTurns, [], '已经没有回复内容的回合不再报可删');
+  assert.deepEqual(res.body.clearedTurns, [1], '/state 也要报被删空的回合（刷新后壳行照样收起）');
+});
+
 // ---------------------------------------------------------------- 官方契约验收
 
 if (officialFoldSurface === null) {
@@ -428,6 +526,22 @@ if (officialFoldSurface === null) {
       sourceEventSeqs: [999],
     });
     assert.throws(() => officialFoldSurface(broken));
+  });
+
+  await check('官方 foldSurface 接受多段替换事件：提问留下、两截回复都离场', () => {
+    const ours = ourFoldSurface(wholeTurnHarness.state.log).nodes;
+    const official = officialFoldSurface(wholeTurnHarness.state.log).nodes;
+    assert.deepEqual(ours, official, '自研折叠与官方折叠结果必须逐位一致');
+    assert.ok(official.includes(2) && official.includes(10), '真人提问必须还在官方 surface 上');
+    for (const seq of [4, 6, 11]) assert.ok(!official.includes(seq), `seq ${seq} 应离开官方 surface`);
+  });
+
+  await check('官方 foldSurface 接受"只删一段"的单条替换：另一段仍在 surface 上', () => {
+    const ours = ourFoldSurface(segmentHarness.state.log).nodes;
+    const official = officialFoldSurface(segmentHarness.state.log).nodes;
+    assert.deepEqual(ours, official, '自研折叠与官方折叠结果必须逐位一致');
+    assert.ok(official.includes(4) && official.includes(6), '没被点的那一段必须原样留在模型上下文里');
+    assert.ok(!official.includes(11), '被点的那一段离开 surface');
   });
 }
 

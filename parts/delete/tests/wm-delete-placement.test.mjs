@@ -484,6 +484,145 @@ check('看到新内容会安排一次防抖刷新（不是立即发请求）', (
   assert.equal(controller.refreshTimer, null, 'dispose 应清掉 timer');
 });
 
+check('思考分组行（flow key 是 JSON）也能按裸节点键隐藏（修掉"删不掉的思考行"）', () => {
+  documentRoot.children.length = 0;
+  const { component, controller } = mount();
+  // 宿主给「思考 / 正文」分组行发的 flow key 是 JSON.stringify([nodeKey, groupPart])，
+  // data-chat-node-key 才是裸节点键。旧实现只用 flow key 查快照 → 查不到节点 → 这行
+  // 既不隐藏也没入口，删完回复后转录上会留一条删不掉的思考行。
+  const row = el('div', {
+    'data-chat-flow-key': JSON.stringify(['7:1', 'reasoning']),
+    'data-chat-node-key': '7:1',
+  });
+  row.appendChild(el('div', {}, { display: 'block' }));
+  documentRoot.appendChild(row);
+  controller.publish({ surfaceReady: true, surface: new Set([10]), hidden: new Map([[20, 'reply']]) });
+  render(component, controller, { '7:1': { kind: 'assistant-step', anchorSeq: 20, data: { finalNode: { seq: 20 } } } });
+  assert.equal(row.dataset.dshwdHidden, '1', '思考分组行必须跟着被删的步骤一起隐藏');
+  controller.dispose();
+});
+
+check('过程分组壳（data-step-process）：成员全部被删 → 壳一起收起', () => {
+  documentRoot.children.length = 0;
+  const { component, controller } = mount();
+  // 宿主 ChatGroupSeat 的根：data-chat-flow-key = 客户端合成的分组键（快照里没有节点），
+  // data-chat-turn = 回合号，data-step-process 是壳的标记；成员渲染在壳**内部**。
+  const shell = el('div', {
+    'data-chat-flow-key': JSON.stringify(['process', '7:1', null]),
+    'data-chat-turn': '7',
+    'data-step-process': 'true',
+  });
+  const memberA = el('div', { 'data-chat-flow-key': '7:1', 'data-chat-node-key': '7:1' });
+  const memberB = el('div', { 'data-chat-flow-key': '7:2', 'data-chat-node-key': '7:2' });
+  shell.appendChild(memberA);
+  shell.appendChild(memberB);
+  documentRoot.appendChild(shell);
+  controller.publish({ surfaceReady: true, surface: new Set([10]), hidden: new Map([[20, 'reply'], [21, 'reply']]) });
+  render(component, controller, {
+    '7:1': { kind: 'assistant-step', anchorSeq: 20, data: { step: 1, finalNode: { seq: 20 } } },
+    '7:2': { kind: 'assistant-step', anchorSeq: 21, data: { step: 2, finalNode: { seq: 21 } } },
+  });
+  assert.equal(memberA.dataset.dshwdHidden, '1', '成员行先被隐藏');
+  assert.equal(memberB.dataset.dshwdHidden, '1', '成员行先被隐藏');
+  assert.equal(shell.dataset.dshwdHidden, '1', '成员全隐藏后，过程壳也要收起（否则就是删不掉的「执行了命令」）');
+  controller.dispose();
+});
+
+check('过程分组壳：还有活着的成员时不许收起', () => {
+  documentRoot.children.length = 0;
+  const { component, controller } = mount();
+  const shell = el('div', {
+    'data-chat-flow-key': JSON.stringify(['process', '8:1', null]),
+    'data-chat-turn': '8',
+    'data-step-process': 'true',
+  });
+  const memberA = el('div', { 'data-chat-flow-key': '8:1', 'data-chat-node-key': '8:1' });
+  const memberB = el('div', { 'data-chat-flow-key': '8:2', 'data-chat-node-key': '8:2' });
+  shell.appendChild(memberA);
+  shell.appendChild(memberB);
+  documentRoot.appendChild(shell);
+  controller.publish({ surfaceReady: true, surface: new Set([30, 31]), hidden: new Map([[30, 'step']]) });
+  render(component, controller, {
+    '8:1': { kind: 'assistant-step', anchorSeq: 30, data: { step: 1, finalNode: { seq: 30 } } },
+    '8:2': { kind: 'assistant-step', anchorSeq: 31, data: { step: 2, finalNode: { seq: 31 } } },
+  });
+  assert.equal(memberA.dataset.dshwdHidden, '1');
+  assert.equal(memberB.dataset.dshwdHidden, undefined, '活着的成员不能藏');
+  assert.equal(shell.dataset.dshwdHidden, undefined, '组里还有活内容时，壳必须留着');
+  controller.dispose();
+});
+
+check('回合已被删空：映射不到 surface 节点的行（重试行等）按回合号收起', () => {
+  documentRoot.children.length = 0;
+  const { component, controller } = mount();
+  // 模型重试行：anchorSeq 是 llm/retry 事件的 seq（非 surface 节点），
+  // 无论怎么删都不会出现在隐藏台账里 —— 只能靠 data-chat-turn 兜底。
+  const row = el('div', { 'data-chat-flow-key': 'retry-7', 'data-chat-turn': '7' });
+  row.appendChild(el('div', {}, { display: 'block' }));
+  documentRoot.appendChild(row);
+  const question = el('div', { 'data-chat-flow-key': 'q7', 'data-chat-turn': '7' });
+  question.appendChild(el('div', {}, { display: 'block' }));
+  documentRoot.appendChild(question);
+  controller.publish({ surfaceReady: true, surface: new Set(), hidden: new Map(), clearedTurns: new Set([7]) });
+  render(component, controller, {
+    'retry-7': { kind: 'model-retry', anchorSeq: 999, data: { turn: 7 } },
+    q7: { kind: 'user', anchorSeq: 998, data: { seq: 998, turn: 7 } },
+  });
+  assert.equal(row.dataset.dshwdHidden, '1', '删空回合里的重试行必须收起（seq 判据对它无效）');
+  assert.equal(question.dataset.dshwdHidden, undefined, '真人提问行必须留下（方案一：留 A 与中途补发的 C）');
+  controller.dispose();
+});
+
+check('每段回复都有自己的删除按钮：段尾助手行有，段中间的行不重复长', () => {
+  documentRoot.children.length = 0;
+  const { component, controller } = mount();
+  // 一个回合被插话切成两段：段1 = 步骤1~2（段尾 seq 40），段2 = 步骤3（段尾 seq 50）
+  const midRow = bareRow('s1', 30);
+  const tailRow = bareRow('s2', 40);
+  const otherTail = bareRow('s3', 50);
+  controller.publish({
+    surfaceReady: true,
+    surface: new Set([30, 40, 50]),
+    segmentTails: new Set([40, 50]),
+    segmentsByTurn: { 1: 2 },
+  });
+  render(component, controller, {
+    s1: { kind: 'assistant-step', anchorSeq: 30, data: { turn: 1, step: 1, finalNode: { seq: 30, messageId: 'm30' } } },
+    s2: { kind: 'assistant-step', anchorSeq: 40, data: { turn: 1, step: 2, finalNode: { seq: 40, messageId: 'm40' } } },
+    s3: { kind: 'assistant-step', anchorSeq: 50, data: { turn: 1, step: 3, finalNode: { seq: 50, messageId: 'm50' } } },
+  });
+  // 段尾行：有「删除这条回复」按钮，点它删的就是这一段（scope 由确认框决定，默认这一段）
+  const tailButton = tailRow.row.querySelector('[class*="dshwd-row-action"]');
+  assert.ok(tailButton, '段尾助手行必须长出删除按钮（回合中途插话之前的那一段也要有）');
+  assert.equal(tailButton.getAttribute('aria-label'), 'action.tooltip.reply');
+  assert.ok(otherTail.row.querySelector('[class*="dshwd-row-action"]'), '另一段的段尾同样要有自己的按钮');
+  // 段中间的行：不重复长按钮（精细删除走思考卡/工具卡的「删这一步」）
+  assert.equal(midRow.row.querySelector('[class*="dshwd-row-action"]'), null, '段中间的行不该重复长按钮');
+  // 点下去打开的是 reply 确认框，并且带上了回合号（确认框据此判断能否提供"整轮"选项）
+  tailButton.onclick({ preventDefault() {}, stopPropagation() {} });
+  const dialog = controller.getSnapshot().dialog;
+  assert.equal(dialog.mode, 'reply');
+  assert.equal(dialog.seq, 40);
+  assert.equal(dialog.turn, 1);
+  controller.dispose();
+});
+
+check('段信息还没抓回来时乐观放行（按钮先出现，抓到后再收敛到段尾）', () => {
+  documentRoot.children.length = 0;
+  const { component, controller } = mount();
+  const row = bareRow('t1', 60);
+  controller.publish({ surfaceReady: false, surface: new Set(), segmentTails: new Set() });
+  render(component, controller, {
+    t1: { kind: 'assistant-step', anchorSeq: 60, data: { turn: 1, step: 1, finalNode: { seq: 60, messageId: 'm60' } } },
+  });
+  // 没拿到段信息时不能把入口藏起来（否则用户以为又"没有删除按钮"）；
+  // /state 回来之后 segmentTails 生效，只保留段尾那一行的按钮。
+  const button = row.row.querySelector('[class*="dshwd-row-action"]');
+  assert.ok(button, '段信息缺失时应乐观放行');
+  assert.equal(button.getAttribute('aria-label'), 'action.tooltip.reply');
+  controller.dispose();
+});
+
 check('没有新内容时不调度刷新（稳态零额外请求）', () => {
   documentRoot.children.length = 0;
   const { component, controller } = mount();
@@ -504,6 +643,38 @@ check('lastSeq 为 -1（还没抓过 surface）时不误判为新内容', () => 
   assert.equal(actions.children.length, 3, 'lastSeq 未知时不乐观放行');
   controller.dispose();
 });
+
+// 确认框的范围选项：默认只删被点的那一段，勾选「整轮」才下发 scope=turn。
+try {
+  const calls = [];
+  globalThis.fetch = (url, init) => {
+    calls.push({ url: String(url), body: init && typeof init.body === 'string' ? JSON.parse(init.body) : null });
+    return Promise.resolve({ ok: true, json: async () => ({ ok: true, hidden: [], clearedTurns: [] }) });
+  };
+  const deletes = () => calls.filter((call) => call.url.includes('/delete'));
+
+  const { controller } = mount();
+  controller.publish({ segmentsByTurn: { 1: 2 } });
+  controller.open({ mode: 'reply', seq: 40, turn: 1, label: 'reply' });
+  assert.equal(controller.getSnapshot().wholeTurn, false, '默认必须是"只删这一段"');
+  await controller.confirm();
+  assert.equal(deletes().length, 1);
+  assert.equal(deletes()[0].body.scope, undefined, '不勾选时不下发 scope（宿主默认 segment）');
+  assert.equal(deletes()[0].body.seq, 40);
+
+  const second = mount();
+  second.controller.open({ mode: 'reply', seq: 40, turn: 1, label: 'reply' });
+  second.controller.setWholeTurn(true);
+  await second.controller.confirm();
+  assert.equal(deletes().length, 2);
+  assert.equal(deletes()[1].body.scope, 'turn', '勾选整轮才把 scope=turn 交给宿主');
+  passed += 1;
+  console.log('  ✓ 确认框：默认只删这一段，勾选「整轮」才下发 scope=turn');
+} catch (error) {
+  failed += 1;
+  failures.push('确认框 scope');
+  console.error(`  ✗ 确认框：默认只删这一段，勾选「整轮」才下发 scope=turn\n    ${String(error && error.message ? error.message : error)}`);
+}
 
 // load() 会从 /state 读入 lastSeq（否则乐观放行永远不触发）。这条是 async，单独跑。
 try {
