@@ -32,7 +32,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { createDshAdapter } from "./compat/dsh-adapter.js";
 import { decompressAllZstdFrames } from "./compat/zstd-frames.js";
 import { applyWorkspaceMenuPatch } from "./workspace-menu-patch.js";
-import { deleteSessionFiles, listSessions, projectKey, purgeOrphanProjcache, readHeader, reconcileProjcacheForSession, reconcileProjcacheIdentity, relocateSessions } from "./wm-relocate.js";
+import { deleteSessionFiles, encodeSegment, findSessionLog, listSessions, projectKey, purgeOrphanProjcache, readHeader, reconcileProjcacheForSession, reconcileProjcacheIdentity, relocateSessions } from "./wm-relocate.js";
 
 export const name = "dsh-session-manager-wm";
 
@@ -728,8 +728,13 @@ ${rest}`, "utf8");
       for (const session of liveSessions) {
         try {
           const id = String(session.id);
-          const moved = join(sessionsRoot, projectKey(newPath), id, "session.v3.jsonl.zstd");
-          const header = readHeader(readFileSync(moved));
+          // 目录名要**转义**（`:` → `~003A`），日志文件名也不一定是 v3（现在是 v4）。
+          // 以前这里硬拼 `id` + "session.v3.jsonl.zstd"，于是桥接会话（含 `:`）和 v4 会话
+          // 都会 readFileSync 失败 → 被 catch 吞掉 → 活动会话重绑定静默失败。
+          const movedDir = join(sessionsRoot, projectKey(newPath), encodeSegment(id));
+          const movedLog = findSessionLog(movedDir);
+          if (movedLog === undefined) throw new Error(`迁移后的日志文件不存在：${movedDir}`);
+          const header = readHeader(readFileSync(movedLog.file));
           const parsed = JSON.parse(header.line.trim());
           session.header = Object.freeze({ ...parsed });
           rebindLiveWriter(persistence, id, parsed);

@@ -21,7 +21,6 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, r
 import { join } from 'node:path';
 import zlib from 'node:zlib';
 
-const LOG_NAME = 'session.v3.jsonl.zstd';
 const ZSTD_MAGIC = 0xfd2fb528;
 
 /** Mirror of DSH's projectKey (JSONL persistence backend). */
@@ -44,6 +43,51 @@ export function projectKey(cwd) {
 		}
 	}
 	return '--' + ((readable.replace(/^-+/, '') || 'root').slice(0, 251)) + '--';
+}
+
+/**
+ * Decode one escaped path segment back to the raw string (`~003A` → `:`).
+ *
+ * 这是官方 `encodeSegment`（`dsh-session-persistence-jsonl`）的逆运算。会话目录名存的是
+ * **转义后**的 id（`:` → `~003A`，`~` 自身 → `~007E`），而插件各处拿到的永远是**原始 id**。
+ * 漏掉这一步，`lark-link:dm:…:0` 这种桥接会话的目录就永远匹配不上——「删除会话」当场
+ * 掉行、磁盘却纹丝不动，重启后会话又冒出来（一直以为是"自己恢复"）。
+ */
+export function decodeSegment(segment) {
+	return segment.replace(/~([0-9A-Fa-f]{4})/g, (_match, hex) => String.fromCharCode(Number.parseInt(hex, 16)));
+}
+
+/**
+ * Mirror of DSH's `encodeSegment`: one raw string → one filesystem-safe path segment.
+ * 凡是**自己拼会话目录路径**的地方都必须用它——磁盘上存的就是这个转义形式。
+ */
+export function encodeSegment(raw) {
+	if (raw.length === 0) throw new Error('不能编码空路径段');
+	if (raw === '.') return '~002E';
+	if (raw === '..') return '~002E~002E';
+	let out = '';
+	for (let i = 0; i < raw.length; i += 1) {
+		const code = raw.charCodeAt(i);
+		const ch = String.fromCharCode(code);
+		if (ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch)) out += ch;
+		else out += '~' + code.toString(16).toUpperCase().padStart(4, '0');
+	}
+	return out;
+}
+
+/**
+ * 会话日志文件名：DSH 从 v0 一路走到 v4，目录里实际写着哪一代取决于会话创建的版本。
+ * 只认 v3 会把 v4 会话当成「没有日志」整个跳过——迁移于是**静默失效**。
+ */
+const LOG_NAMES = ['session.v4.jsonl.zstd', 'session.v3.jsonl.zstd', 'session.v2.jsonl.zstd', 'session.jsonl.zstd', 'session.jsonl'];
+
+/** 在会话目录里找实际存在的日志文件（返回文件名与完整路径），没有则 undefined。 */
+export function findSessionLog(dir) {
+	for (const name of LOG_NAMES) {
+		const file = join(dir, name);
+		if (existsSync(file)) return { name, file };
+	}
+	return undefined;
 }
 
 /** Structurally scan concatenated zstd frames; returns complete frames plus a torn tail start. */
@@ -130,7 +174,17 @@ export function rewriteHeaderCwd(buffer, newCwd) {
 	return { next, cwd, reason: '' };
 }
 
-/** Every session directory under the sessions root. */
+/**
+ * Every session directory under the sessions root.
+ *
+ * `sessionId` 是**解码后**的原始 id —— 与调用方手里的 id 同形，可以直接比较；
+ * `dirName` 是磁盘上的转义名，需要构造/比较路径时用它。
+ *
+ * 早先这里直接把 `entry.name` 当 sessionId，于是凡是要转义的 id（`:` → `~003A`，
+ * 也就是飞书 lark-link 桥接会话）一律匹配不上：删除会话、identity 对账、
+ * 孤儿缓存清理、迁移时的缓存修补全部**静默**走空（最坑的是删除：界面当场掉行，
+ * 磁盘纹丝不动，重启后会话复活）。
+ */
 export function listSessions(sessionsRoot) {
 	const out = [];
 	if (!existsSync(sessionsRoot)) return out;
@@ -139,7 +193,12 @@ export function listSessions(sessionsRoot) {
 		const projectDir = join(sessionsRoot, project.name);
 		for (const entry of readdirSync(projectDir, { withFileTypes: true })) {
 			if (!entry.isDirectory()) continue;
-			out.push({ sessionId: entry.name, dir: join(projectDir, entry.name), projectDir });
+			out.push({
+				sessionId: decodeSegment(entry.name),
+				dirName: entry.name,
+				dir: join(projectDir, entry.name),
+				projectDir,
+			});
 		}
 	}
 	return out;
@@ -174,8 +233,9 @@ export function relocateSessions(options) {
 	const failed = [];
 	for (const entry of listSessions(sessionsRoot)) {
 		if (only !== undefined && entry.sessionId !== only) continue;
-		const file = join(entry.dir, LOG_NAME);
-		if (!existsSync(file)) continue;
+		const log = findSessionLog(entry.dir);
+		if (log === undefined) continue;
+		const file = log.file;
 		let header;
 		try {
 			header = readHeader(readFileSync(file));
@@ -187,7 +247,10 @@ export function relocateSessions(options) {
 			if (only !== undefined) skipped.push({ sessionId: entry.sessionId, reason: `cwd='${header.cwd}'，与来源不符` });
 			continue;
 		}
-		const targetDir = join(targetProjectDir, entry.sessionId);
+		// 目标目录名必须是**转义后**的 dirName（与 DSH 自己的 sessionDir 命名一致）。
+		// 这里以前用 entry.sessionId，恰好因为当时 sessionId 就是磁盘名才对——
+		// 现在 sessionId 已经是解码后的原始 id，必须改用 dirName。
+		const targetDir = join(targetProjectDir, entry.dirName);
 		if (existsSync(targetDir)) {
 			failed.push({ sessionId: entry.sessionId, reason: '目标目录已存在：' + targetDir });
 			continue;
@@ -199,10 +262,10 @@ export function relocateSessions(options) {
 			if (patched === null) throw new Error('header 改写未产生新内容');
 			renameSync(entry.dir, targetDir);
 			try {
-				writeAtomic(join(targetDir, LOG_NAME), patched);
-				if (readHeader(readFileSync(join(targetDir, LOG_NAME))).cwd !== toCwd) throw new Error('落盘校验失败');
+				writeAtomic(join(targetDir, log.name), patched);
+				if (readHeader(readFileSync(join(targetDir, log.name))).cwd !== toCwd) throw new Error('落盘校验失败');
 			} catch (error) {
-				writeAtomic(join(targetDir, LOG_NAME), original);
+				writeAtomic(join(targetDir, log.name), original);
 				renameSync(targetDir, entry.dir);
 				throw error;
 			}
@@ -308,9 +371,11 @@ export function reconcileProjcacheForSession(options) {
 	if (typeof sessionId !== 'string' || sessionId === '') return false;
 	const entry = listSessions(sessionsRoot).find((item) => item.sessionId === sessionId);
 	if (entry === undefined) return false;
+	const log = findSessionLog(entry.dir);
+	if (log === undefined) return false;
 	let header;
 	try {
-		const { line } = readHeader(readFileSync(join(entry.dir, LOG_NAME)));
+		const { line } = readHeader(readFileSync(log.file));
 		header = JSON.parse(line);
 	} catch {
 		return false;
