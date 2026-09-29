@@ -14,7 +14,8 @@
  * 跑法：node parts/delete/tests/wm-delete-host.test.mjs
  */
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -23,6 +24,21 @@ import { PLUGIN_ID, foldSurface as ourFoldSurface } from '../lib/logic.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SESSION_ID = 'session-8c5d8123-cce9-4c85-9532-6a00c36a92fa';
+
+// 日志隔离。这个半边把每次拒绝写进 $DSH_HOME\dsh-wm-delete.log，而测试以前是直接写进
+// **真实的** DSH_HOME —— 生产和测试的记录混在同一个文件里。排查线上问题时会在里面看到
+// 成批测试造的 session-not-active / busy / invalid，很容易被带偏（别问怎么知道的）。
+const LOG_HOME = mkdtempSync(join(tmpdir(), 'wm-delete-test-'));
+process.env.DSH_HOME = LOG_HOME;
+const DELETE_LOG = join(LOG_HOME, 'dsh-wm-delete.log');
+
+/** 读回日志的最后一条（没有则 null）。 */
+function lastLogEntry() {
+  if (!existsSync(DELETE_LOG)) return null;
+  const lines = readFileSync(DELETE_LOG, 'utf8').split('\n').filter((line) => line.trim().length > 0);
+  if (lines.length === 0) return null;
+  return JSON.parse(lines[lines.length - 1]);
+}
 
 let passed = 0;
 let failed = 0;
@@ -122,7 +138,12 @@ function makeHarness(log, options = {}) {
       },
     },
     get: (name) => {
-      if (name === 'sessions') return options.noLiveSession ? null : { get: (id) => (id === SESSION_ID || id === SESSION_ID.replace('session-', '') ? session : undefined) };
+      if (name === 'sessions') {
+        if (options.noLiveSession) return null;
+        // options.liveIds：把任意形状的会话 id（桥接会话）也认成"已打开"。
+        const live = new Set([SESSION_ID, SESSION_ID.replace('session-', ''), ...(options.liveIds || [])]);
+        return { get: (id) => (live.has(id) ? session : undefined) };
+      }
       if (name === 'sessionQuery') return options.noQuery ? null : { readSession: async () => ({ events: state.log }) };
       if (name === 'sessionPersistence') return { flush: async () => { state.flushed += 1; } };
       if (name === 'sessionController') return undefined;
@@ -362,6 +383,90 @@ await check('会话没有打开（无 live session）→ session-not-active（40
   });
   assert.equal(res.statusCode, 409);
   assert.equal(res.body.code, 'session-not-active');
+});
+
+// ---------------------------------------------------------------- 会话 id 形状（回归：桥接会话删不掉）
+
+/**
+ * 线上事故：DSH 的会话 id **不只有 uuid**。外部桥接进来的会话是别的形状，实测两种：
+ *   lark-link:dm:oc_2a58…:mujqtyuo8ej7:0       （飞书桥接）
+ *   aa_5116dbc90b99549e_sess_aiTbvs5ZwAhL5A    （agents-anywhere）
+ *
+ * 旧白名单 `^(session-)?<uuid>$` 把它们全判成非法：浏览器半边连请求都不发，界面报
+ * 「这个会话当前未激活」（而宿主日志一片空白）；宿主半边则会 400 invalid。
+ * 两边合起来就是「会话明明开着，就是删不掉」。
+ */
+const BRIDGED_SESSION_IDS = [
+  'lark-link:dm:oc_2a58532568e31412e69a47fc0cbb31f6:mujqtyuo8ej7:0',
+  'aa_5116dbc90b99549e_sess_aiTbvs5ZwAhL5A',
+];
+
+for (const bridgedId of BRIDGED_SESSION_IDS) {
+  const label = `${bridgedId.slice(0, 24)}…`;
+
+  await check(`桥接会话 id 能通过白名单并真的删掉（${label}）`, async () => {
+    const h = makeHarness(buildLog(), { liveIds: [bridgedId] });
+    const res = await h.request({
+      method: 'POST',
+      path: '/wm-delete/delete',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: bridgedId, mode: 'message', seq: 3 }),
+    });
+    assert.equal(res.statusCode, 200, `实际 ${res.statusCode} ${JSON.stringify(res.body)}`);
+    assert.equal(res.body.ok, true);
+    assert.ok(h.appended.length >= 1, '应追加了替换事件');
+  });
+
+  await check(`桥接会话 id 未打开时回 session-not-active，而不是 invalid（${label}）`, async () => {
+    const h = makeHarness(buildLog(), { noLiveSession: true });
+    const res = await h.request({
+      method: 'POST',
+      path: '/wm-delete/delete',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: bridgedId, mode: 'message', seq: 3 }),
+    });
+    assert.equal(res.statusCode, 409, `实际 ${res.statusCode} ${JSON.stringify(res.body)}`);
+    assert.equal(res.body.code, 'session-not-active');
+  });
+
+  await check(`/wm-delete/state 也接受桥接会话 id（${label}）`, async () => {
+    const h = makeHarness(buildLog(), { liveIds: [bridgedId] });
+    const res = await h.request({ path: `/wm-delete/state?sessionId=${encodeURIComponent(bridgedId)}` });
+    assert.equal(res.statusCode, 200, `实际 ${res.statusCode} ${JSON.stringify(res.body)}`);
+    assert.equal(res.body.ok, true);
+    assert.equal(res.body.live, true);
+  });
+}
+
+await check('放宽形状后，路径穿越/控制字符/空/超长 仍然一律 400', async () => {
+  const bad = ['../../etc/passwd', '..\\..\\windows', 'a/b', 'a\\b', '..', '.', '', '   ', 'x'.repeat(201), 'bad\u0000id', 'bad\nid'];
+  const h = makeHarness(buildLog());
+  for (const id of bad) {
+    const res = await h.request({
+      method: 'POST',
+      path: '/wm-delete/delete',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: id, mode: 'message', seq: 3 }),
+    });
+    assert.equal(res.statusCode, 400, `id=${JSON.stringify(id)} 应 400，实际 ${res.statusCode}`);
+    assert.equal(res.body.code, 'invalid', `id=${JSON.stringify(id)} 的 code 应为 invalid`);
+  }
+});
+
+await check('拒绝日志里带上 sessionId（否则线上排查看不出是哪个会话）', async () => {
+  const id = BRIDGED_SESSION_IDS[0];
+  const h = makeHarness(buildLog(), { noLiveSession: true });
+  await h.request({
+    method: 'POST',
+    path: '/wm-delete/delete',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ sessionId: id, mode: 'message', seq: 3 }),
+  });
+  const entry = lastLogEntry();
+  assert.ok(entry, '应当写出了日志');
+  assert.equal(entry.message, '/wm-delete/delete 被拒绝');
+  assert.equal(entry.data.sessionId, id, '日志里必须能看到是哪个会话');
+  assert.equal(entry.data.code, 'session-not-active');
 });
 
 await check('回合未闭合（还在跑）→ busy（409）', async () => {

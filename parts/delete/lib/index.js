@@ -46,7 +46,29 @@ export const name = 'dsh-wm-delete';
 export const inject = ['webServer'];
 
 const ROUTE_PREFIX = '/wm-delete';
-const SESSION_ID_RE = /^(session-)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * 会话 id 的**形状不只有 uuid**。DSH 里外部桥接进来的会话是别的样子，实测两种：
+ *
+ *   lark-link:dm:oc_2a58…:mujqtyuo8ej7:0      （飞书桥接）
+ *   aa_5116dbc90b99549e_sess_aiTbvs5ZwAhL5A   （agents-anywhere）
+ *
+ * 早先这里是 `^(session-)?<uuid>$`，于是这类会话的删除请求全被 400 invalid 挡在门外，
+ * 而浏览器半边用同一套白名单，连请求都发不出来（表现为「会话未激活」，且宿主无日志）。
+ *
+ * 现在**不按形状收紧**——形状交给 sessionQuery / sessionController 去认，认不出会明确
+ * 回 404/409。这里只保证：非空、长度有界、能安全地当路径用。
+ */
+const MAX_SESSION_ID_LENGTH = 200;
+function isSupportedSessionId(value) {
+  if (typeof value !== 'string') return false;
+  const id = value.trim();
+  if (id.length === 0 || id.length > MAX_SESSION_ID_LENGTH) return false;
+  if (id === '.' || id === '..') return false;
+  // 会话 id 会被拼进存储路径，绝不能让它穿越目录。
+  return !/[\\/\u0000-\u001f\u007f]/.test(id);
+}
+
 const MODES = new Set(['message', 'step', 'reply']);
 
 // ---------------------------------------------------------------- 日志
@@ -430,9 +452,10 @@ function sessionIdFromQuery(url) {
 }
 
 function requireSessionId(value) {
-  if (!value) throw new HttpError(400, 'invalid', 'sessionId required');
-  if (!SESSION_ID_RE.test(value)) throw new HttpError(400, 'invalid', 'invalid session id');
-  return value;
+  const id = typeof value === 'string' ? value.trim() : '';
+  if (!id) throw new HttpError(400, 'invalid', 'sessionId required');
+  if (!isSupportedSessionId(id)) throw new HttpError(400, 'invalid', 'unsupported session id');
+  return id;
 }
 
 // ---------------------------------------------------------------- 插件
@@ -449,13 +472,20 @@ export function apply(ctx) {
         sendJson(res, 405, { ok: false, code: 'method', error: 'GET only' });
         return;
       }
+      // 记**原始** id（不校验）：非法 id 正是最需要留痕的情况，而这个插件当初把
+      // uuid 当唯一合法形状，害得排查时连"是哪个会话"都看不到。
+      const rawSessionId = sessionIdFromQuery(req.url);
       try {
-        const sessionId = requireSessionId(sessionIdFromQuery(req.url));
+        const sessionId = requireSessionId(rawSessionId);
         sendJson(res, 200, { ok: true, ...(await stateOf(ctx, sessionId)) });
       } catch (error) {
         const status = error instanceof HttpError ? error.status : 500;
         const code = error instanceof HttpError ? error.code : 'internal';
-        logLine(status >= 500 ? 'error' : 'warn', '/wm-delete/state 失败', { code, err: String((error && error.message) || error) });
+        logLine(status >= 500 ? 'error' : 'warn', '/wm-delete/state 失败', {
+          code,
+          sessionId: rawSessionId.slice(0, 200),
+          err: String((error && error.message) || error),
+        });
         sendJson(res, status, { ok: false, code, error: String((error && error.message) || error) });
       }
     },
@@ -478,14 +508,16 @@ export function apply(ctx) {
         sendJson(res, 400, { ok: false, code: 'invalid', error: 'malformed JSON body' });
         return;
       }
+      const rawSessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
       try {
-        const sessionId = requireSessionId(typeof body.sessionId === 'string' ? body.sessionId.trim() : '');
+        const sessionId = requireSessionId(rawSessionId);
         sendJson(res, 200, { ok: true, ...(await deleteTarget(ctx, sessionId, body)) });
       } catch (error) {
         const status = error instanceof HttpError ? error.status : 500;
         const code = error instanceof HttpError ? error.code : 'internal';
         logLine(status >= 500 ? 'error' : 'warn', '/wm-delete/delete 被拒绝', {
           code,
+          sessionId: rawSessionId.trim().slice(0, 200),
           err: String((error && error.message) || error),
         });
         sendJson(res, status, { ok: false, code, error: String((error && error.message) || error) });

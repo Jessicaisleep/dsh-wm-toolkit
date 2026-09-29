@@ -189,7 +189,7 @@ const fakeRequire = (specifier) => {
 const SESSION_ID = 'session-8c5d8123-cce9-4c85-9532-6a00c36a92fa';
 
 /** 挂上插件，取回 OverlayEntry 组件与真实 controller。 */
-function mount() {
+function mount(sessionId = SESSION_ID) {
   const registrations = [];
   const ctx = {
     effect: (fn) => fn(),
@@ -205,7 +205,7 @@ function mount() {
   definition.factory(fakeRequire).apply(ctx);
   const overlay = registrations.find((entry) => entry.options.name === 'conversation.input.overlay');
   assert.ok(overlay, '应注册 conversation.input.overlay');
-  const injected = overlay.options.inject(SESSION_ID);
+  const injected = overlay.options.inject(sessionId);
   return { component: overlay.component, controller: injected.controller };
 }
 
@@ -695,6 +695,74 @@ try {
   failed += 1;
   failures.push('load() lastSeq');
   console.error(`  ✗ load() 从 /state 读入 lastSeq\n    ${String(error && error.message ? error.message : error)}`);
+}
+
+// ---------------------------------------------------------------- 会话 id 形状（回归：桥接会话报"未激活"）
+
+/**
+ * 线上事故：DSH 的会话 id **不只有 uuid**。外部桥接进来的会话是别的形状，实测两种：
+ *   lark-link:dm:oc_2a58…:mujqtyuo8ej7:0       （飞书）
+ *   aa_5116dbc90b99549e_sess_aiTbvs5ZwAhL5A    （agents-anywhere）
+ *
+ * 旧白名单 `^(session-)?<uuid>$` 把它们判成不可用，用户点删除时**本地**就被拦掉，
+ * 界面报「这个会话当前未激活，请先打开该会话再删除」——而宿主一条日志都没有。
+ * "会话明明开着"和"宿主没日志"这两点合起来，指向的就是这条本地判定。
+ */
+try {
+  const bridgedIds = [
+    'lark-link:dm:oc_2a58532568e31412e69a47fc0cbb31f6:mujqtyuo8ej7:0',
+    'aa_5116dbc90b99549e_sess_aiTbvs5ZwAhL5A',
+  ];
+  for (const bridged of bridgedIds) {
+    const calls = [];
+    globalThis.fetch = (url, init) => {
+      calls.push({ url: String(url), body: init && typeof init.body === 'string' ? JSON.parse(init.body) : null });
+      return Promise.resolve({ ok: true, json: async () => ({ ok: true, hidden: [], clearedTurns: [] }) });
+    };
+    const { controller } = mount(bridged);
+    controller.open({ mode: 'message', seq: 3, label: 'msg' });
+    await controller.confirm();
+    const deletes = calls.filter((call) => call.url.includes('/wm-delete/delete'));
+    assert.equal(deletes.length, 1, `${bridged} 应真的发出删除请求，而不是本地拦掉`);
+    assert.equal(deletes[0].body.sessionId, bridged, '请求里要带原始会话 id（不加工）');
+    assert.equal(controller.getSnapshot().failure, null, '不该报任何失败');
+    controller.dispose();
+  }
+  passed += 1;
+  console.log('  ✓ 桥接会话 id（lark-link / agents-anywhere）能真的把删除发出去');
+} catch (error) {
+  failed += 1;
+  failures.push('桥接会话 id 放行');
+  console.error(`  ✗ 桥接会话 id 能真的把删除发出去\n    ${String(error && error.message ? error.message : error)}`);
+}
+
+try {
+  const calls = [];
+  globalThis.fetch = (url) => {
+    calls.push(String(url));
+    return Promise.resolve({ ok: true, json: async () => ({ ok: true }) });
+  };
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(' '));
+  try {
+    // 含路径分隔符：形状可以放宽，但"能安全当路径用"这条底线不能放。
+    const { controller } = mount('a/b');
+    controller.open({ mode: 'message', seq: 3, label: 'msg' });
+    await controller.confirm();
+    assert.equal(calls.length, 0, '会话 id 不可用时连 state 带 delete 一个请求都不该发');
+    assert.equal(controller.getSnapshot().failure, 'unsupported-session', '应回精确的失败码，而不是笼统的 session-not-active');
+    assert.equal(warnings.length, 1, '本地拦截必须在 console 留下痕迹（否则宿主日志一片空白）');
+    controller.dispose();
+  } finally {
+    console.warn = originalWarn;
+  }
+  passed += 1;
+  console.log('  ✓ 不可用的会话 id：不发请求 + 精确失败码 + console 留痕');
+} catch (error) {
+  failed += 1;
+  failures.push('不可用会话 id 拦截');
+  console.error(`  ✗ 不可用的会话 id：不发请求 + 精确失败码 + console 留痕\n    ${String(error && error.message ? error.message : error)}`);
 }
 
 console.log(`\nwm-delete 按钮位置回归：${passed}/${passed + failed} 通过`);
