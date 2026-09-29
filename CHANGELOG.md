@@ -4,6 +4,59 @@
 半边各自的详细变更史保留在 `parts/recall/CHANGELOG-WM.md` 与 `parts/manager/CHANGELOG.md`；
 本文件只记录**面向使用者**的包级版本。
 
+## 0.2.10 — 2026-09-29
+
+### 修：桥接会话里点删除，报「这个会话当前未激活，请先打开该会话再删除」（可会话明明开着）
+
+**现象**：在**飞书桥接**（lark-link）或 agents-anywhere 桥接出来的会话里删指令 / 回复，
+界面报「这个会话当前未激活，请先打开该会话再删除」——会话明明就开着；更要命的是
+`$DSH_HOME\dsh-wm-delete.log` 里**一条记录都没有**。
+
+**根因**：插件把「会话 id 的合法形状」写死成了 uuid：
+
+```
+/^(session-)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+```
+
+而 DSH 的会话 id **不只有 uuid**。实测两种桥接形状：
+
+| 来源 | 会话 id 形状 | 含 `:` |
+|---|---|---|
+| 飞书（lark-link） | `lark-link:dm:oc_2a58…:mujqtyuo8ej7:0` | 是 |
+| agents-anywhere | `aa_5116dbc90b99549e_sess_aiTbvs5ZwAhL5A` | 否 |
+
+两边于是各失败一半：**浏览器半边**判 `usableSessionId()` 为假，`confirm()` 直接
+`publish({ failure: 'session-not-active' })` **一个请求都不发**——所以宿主日志全空，
+排查时极容易被误读成「请求被服务端拒绝了」；**宿主半边**就算收到请求也会 400 invalid。
+
+**修复**：不再按形状收紧，改成**路径安全 + 长度有界**的判定（非空、≤200、拒绝
+`/ \` 与控制字符、拒绝 `.` / `..`），形状交给 `sessionQuery` / `sessionController` 去认
+——认不出会明确回 404/409，比在本地猜准得多。
+
+| 位置 | 改动 |
+|---|---|
+| `parts/delete/lib/client.js` | 白名单放宽；本地拦截改用新的失败码 `unsupported-session`（不再谎报「未激活」），并 `console.warn` 打出真实 id |
+| `parts/delete/lib/index.js` | 同一个 `isSupportedSessionId()`；**路径穿越底线没放**（`../etc/passwd`、`a/b`、`a\b`、超长、空 → 仍 400） |
+| 词典 | 新增 `error.unsupported-session`（中英对齐） |
+| `parts/delete/tests/*` | 新增 8 条回归：两种桥接 id 能真的删掉、未打开时回 session-not-active 而不是 invalid、路径穿越/控制字符/超长仍 400、拒绝日志必须带 sessionId |
+
+**顺带修掉一个排查陷阱**：删除半边的测试以前把日志直接写进**真实的** `$DSH_HOME`，
+测试记录和生产记录混在同一个 `dsh-wm-delete.log` 里（里面成批的
+`session-not-active` / `busy` / `invalid` 全是测试造的，能把人带偏很远）。
+现在隔离到临时目录。
+
+### 改：拒绝日志带上 sessionId
+
+`/wm-delete/delete` 与 `/wm-delete/state` 的失败记录现在都带 `sessionId`，记的是
+**原始未校验值**——非法 id 恰恰是最需要留痕的情况。之前日志里只有 `code`，
+根本看不出是哪个会话出的问题。
+
+### 文档
+
+`RELEASE.md` 从「0.2.5 / CI 还没跑通」的旧状态更新到 0.2.9 现状：CI 全链路已通
+（Trusted Publisher 早绑定）、已发布版本清单、本机已有 node/npm 不必再用 DSH 自带 Node、
+发版幂等说明、以及用 sha256 比对已发布产物的验法。
+
 ## 0.2.9 — 2026-09-28
 
 ### 修：删完 AI 回复后，转录上还杵着一串过程壳（「执行了命令」「已重试模型请求」…）
