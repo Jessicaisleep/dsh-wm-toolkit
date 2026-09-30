@@ -31,7 +31,6 @@ import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { createDshAdapter } from "./compat/dsh-adapter.js";
 import { decompressAllZstdFrames } from "./compat/zstd-frames.js";
-import { applyWorkspaceMenuPatch } from "./workspace-menu-patch.js";
 import { deleteSessionFiles, encodeSegment, findSessionLog, listSessions, projectKey, purgeOrphanProjcache, readHeader, reconcileProjcacheForSession, reconcileProjcacheIdentity, relocateSessions } from "./wm-relocate.js";
 
 export const name = "dsh-session-manager-wm";
@@ -219,23 +218,10 @@ export function apply(ctx) {
     res.end(JSON.stringify(obj));
   };
 
-  /* wm fork: expose "迁移到新文件夹…" in the built-in workspace ⋯ menu.
-     Guarded overlay: anchors must match uniquely, the result must pass
-     `node --check`, a backup is kept, and a native DSH implementation makes
-     this stand down by itself. */
-  try {
-    const menuPatch = applyWorkspaceMenuPatch(ctx, {});
-    if (menuPatch.changed) {
-      ctx.logger.info(`session-manager(wm): 工作区菜单补丁已应用（${menuPatch.target}）`);
-    } else {
-      ctx.logger.info(`session-manager(wm): 工作区菜单补丁未应用：${menuPatch.reason}`);
-    }
-    if (menuPatch.problems !== undefined) {
-      ctx.logger.warn(`session-manager(wm): 补丁锚点问题 ${JSON.stringify(menuPatch.problems)}`);
-    }
-  } catch (error) {
-    ctx.logger.warn(`session-manager(wm): 工作区菜单补丁失败（不影响其余功能）：${String(error)}`);
-  }
+  /* [local patch 2026-09-30] 原工作区 ⋯ 菜单补丁调用已断开：官方桌面端把内置客户端包
+     打进只读的 resources/app.asar，补丁连备份文件都写不出来，上游也没有工作区行菜单
+     slot，保留调用只会持续报错。workspace-menu-patch.js、宿主 /workspace-migrate 路由
+     与浏览器半边 __DSH_WM__ 挂钩均原样保留。 */
 
   /** Remove one id from the registry-global archive set (durable, serialized). */
   const unarchiveSession = async (sessionId) => {
@@ -642,9 +628,32 @@ ${rest}`, "utf8");
          moment the path changes. */
       const accountedIds = Array.isArray(entity.sessionIds) ? [...entity.sessionIds] : [];
 
+      /* `intoParent`：客户端给的是「放工作区文件夹的那个文件夹」（系统文件夹选择
+         器选出来的目标位置），不是完整目标路径。工作区文件夹保留原名，由这里拼
+         出完整路径；目标已存在同名文件夹时直接拒绝 —— 否则会静默落进「只重连」
+         分支，把工作区记录指到一个可能属于别的项目的文件夹。 */
+      let targetInput = to;
+      if (body?.intoParent === true) {
+        const parent = to.replace(/[\\/]+$/, "");
+        if (parent === "") throw new Error("目标位置不能为空");
+        const name = String(oldPath).split(/[\\/]+/).filter(Boolean).pop() ?? "";
+        if (name === "") throw new Error(`无法从当前路径推断工作区文件夹名：${oldPath}`);
+        const sep = String(oldPath).includes("\\") ? "\\" : "/";
+        const derived = `${parent}${sep}${name}`;
+        /* 目标就是原路径时不算「已存在」：让它落到下面「新路径与当前路径相同」
+           那一支，给出更直白的提示。 */
+        const sameAsOld = derived.toLowerCase() === String(oldPath).toLowerCase();
+        let taken = false;
+        if (!sameAsOld) {
+          try { taken = (await stat(derived)).isDirectory(); } catch { taken = false; }
+        }
+        if (taken) throw new Error(`目标位置已存在同名文件夹：${derived}。请换一个位置；如果那个文件夹就是这个工作区的新家，请先把旧的移走或改名。`);
+        targetInput = derived;
+      }
+
       /* Normalise the target: a trailing separator would otherwise reach
          dirname()/mkdir() as a drive root and blow up with EPERM. */
-      const rawTarget = to.replace(/[\\/]+$/, "");
+      const rawTarget = targetInput.replace(/[\\/]+$/, "");
       if (rawTarget === "") throw new Error("新文件夹路径不能为空");
       if (!isAbsolute(rawTarget)) throw new Error(`新文件夹路径必须是绝对路径：${to}`);
       let newPath = rawTarget;
@@ -1555,6 +1564,14 @@ ctx.logger.warn(`session-manager: api error: ${String(error)}; type=${error?.con
               ctx.logger.warn(`session-manager: listWorkspaces failed: ${String(error)}`);
               return send(res, 500, { ok: false, error: String(error instanceof Error ? error.message : error) });
             }
+          }
+
+          /* wm fork: 宿主能力探针。浏览器半边靠它判断跑着的这半边是不是新版：
+             `intoParent` 只有新宿主认识，旧宿主会把它当普通 `to` —— 那是「目标已
+             存在 = 只重指记录」，会把工作区记录指到用户选的父文件夹上。所以旧
+             宿主必须能被认出来，宁可让用户先重启 DSH。 */
+          if (req.method === "GET" && path === "/workspace-migrate/capabilities") {
+            return send(res, 200, { ok: true, result: { intoParent: true, version: 2 } });
           }
 
           /* wm fork: migrate a whole workspace folder (repairs the workspace

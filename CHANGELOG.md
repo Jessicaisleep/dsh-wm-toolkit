@@ -4,6 +4,76 @@
 半边各自的详细变更史保留在 `parts/recall/CHANGELOG-WM.md` 与 `parts/manager/CHANGELOG.md`；
 本文件只记录**面向使用者**的包级版本。
 
+## 0.2.11 — 2026-09-30
+
+### 改：工作区迁移换位置、换名字，目标文件夹改用系统选择器
+
+**三处变化**：
+
+1. **入口挪到会话右上角**（`conversation.session.header.utilities`，跟「在应用中打开 / 计划 /
+   导出会话日志」同一排）。原来的位置在侧边栏底部，和「会话管理」「Lark」挤在一行。
+2. **名字改为「迁移工作区」**（原「迁移到新文件夹…」）。旧名字极容易被读成
+   「把这段对话搬到另一个工作区」，而它搬的是**工作区文件夹本身**——顺带说清楚：
+   `git log -S "选择文件夹"` 全历史 0 命中，这个入口从 `0.1.0` 起就是手填路径的输入框。
+3. **目标位置改用系统文件夹选择器**：点「选择文件夹…」直接拉起系统对话框
+   （官方 `remote.directoryPicker`，本机是 `127.0.0.1` + win32 ⇒ native），选完显示
+   `将搬到：<完整路径>`；手填路径依然可用。语义仍然是**「选父文件夹，工作区文件夹以原名搬进去」**。
+
+**点开不再先弹一层工作区列表**：以前无法确定当前会话属于哪个工作区时，会退化成
+「先展开现有工作区列表让你选」。现在**一律直接开对话框**，对话框顶部只在确实认不出
+当前工作区时才出现工作区下拉。
+
+**当前工作区怎么认**：`conversation.session.header.utilities` 会把当前会话 id 作为
+`sessionId` prop 直接传进来（官方契约 `standardProps` 里就写着 `sessionId: SessionId`），
+优先级为 ① 该 id 落在哪个工作区的 `sessionIds` 里 → ② 会话快照的 `workspaceId` →
+③ 会话 `cwd` 对工作区 `path` → ④ 只剩一个工作区就用它。
+
+### 修：点「选择文件夹…」报 `cannot get property "remote.directoryPicker" without inject`
+
+**根因（cordis 的服务解析机制，不是操作问题）**：
+
+- 每个 remote 命名空间在服务表里的键名是**带点的全名**（官方 `dsh-api-gateway` 里
+  `function remoteServiceKey(namespace) { return \`remote.${namespace}\`; }`），所以报错信息里
+  才会出现 `remote.directoryPicker` 这个带点的名字；
+- 更关键的是，`ctx.remote.<ns>` **按调用栈当前上下文校验 inject**。官方
+  `dsh-api-job-controller` 的注释把这点写得很直白：命名空间要在自己上下文还是当前上下文时
+  取好，因为后续访问发生在 *"a React event, a carrier retry — whose dynamic context has
+  **not declared** `remote.job`"*。
+- 我们原来正是在**按钮点击的 React 回调里**才去取 `wmRuntime.remote.directoryPicker`，
+  那条栈没有声明这个服务，于是抛错。
+
+**修复**：在 `apply(ctx)` 里用 `ctx.inject(["remote", "remote.directoryPicker"], cb)` 起一个
+独立 fiber，**在声明了该服务的上下文里**提前把句柄存进模块级变量；点击时直接用存好的句柄。
+读取优先走 `ctx.get(...)`——cordis 源码原文 *"Read a service from the store without the
+inject requirement"*，它是唯一不要求 inject 的读取口。拿不到服务时，这个 fiber 只是挂着，
+**不拖累插件主体**：按钮照常注册，选择器自动退回手填路径。
+
+### 修：连点「迁移工作区」会开出多个窗口
+
+对话框是命令式 portal 挂在 `document.body` 上的，没有单例保护。现在加了模块级
+`wmMigrateOpen`：已经开着就只把焦点还给里面的输入框，不再开第二个；关闭（含 Esc）时清空。
+
+### 修：左下角「会话管理」被挤成竖排
+
+**现象**：三个按钮（远程控制 / 会话管理 / Lark）挤在一行时，带汉字的按钮被压到**每行一个字**；
+Lark 那个是自带边框的 13px 药丸、不会缩，看着反而像"变大了"。
+
+**根因**：官方那行 `_footerActions` 是 `display:flex` 且不换行，而 flex 子项默认
+`min-width:auto` —— 带汉字的按钮 min-content 就是**单个字的宽度**。
+
+**修复**：给那行加 `flex-wrap:wrap` + `row-gap`，子项 `flex:0 0 auto`（挤不下就**换行**，
+不压字）；窄轨（rail 56px）时跟随官方同类占用者（PluginsPanelIcon / CordisPanel）**只显示图标**。
+
+### 新增宿主接口
+
+| 接口 | 用途 |
+|---|---|
+| `GET /session-manager/api/workspace-migrate/capabilities` → `{intoParent:true, version:2}` | 客户端据此判断宿主那半边是否为**认识 `intoParent`** 的新版；旧宿主会红字提示「宿主那半边还是旧代码，请先完整重启 DSH」并禁用提交 |
+
+宿主对 `intoParent` 请求会先把「父文件夹 + 原文件夹名」拼成目标路径，**并且只在与原路径不同时**
+才检查同名占用；同名就拒绝（`目标位置已存在同名文件夹：…`）——否则旧语义会走
+「目标已存在 ⇒ 只重指记录，不搬文件夹」，把工作区记录指到父文件夹上。
+
 ## 0.2.10 — 2026-09-29
 
 ### 修：桥接会话里点删除，报「这个会话当前未激活，请先打开该会话再删除」（可会话明明开着）

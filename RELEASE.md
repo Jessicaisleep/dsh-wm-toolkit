@@ -1,6 +1,6 @@
 # RELEASE.md — 发布清单
 
-包名 `dsh-wm-toolkit`（2026-09-18 首发 `0.1.0`），当前版本 `0.2.10`。
+包名 `dsh-wm-toolkit`（2026-09-18 首发 `0.1.0`），当前版本 `0.2.11`。
 
 ## 0. 发布前的验证状态
 
@@ -23,6 +23,13 @@
 3. 若某项异常，先看上面的日志（`半边应用失败（已隔离）` 会带堆栈），再看浏览器控制台。
 
 > 注意：客户端半边改动后需要**刷新页面**（Ctrl+Shift+R）才生效；宿主半边改动需要**重启 DSH**。
+
+> **`0.2.11` 尚未运行验证的部分**：新增的宿主路由
+> `GET /session-manager/api/workspace-migrate/capabilities`（只有重启 DSH 才会加载）与客户端
+> 的系统文件夹选择器（`ctx.inject(["remote","remote.directoryPicker"])` 提前取句柄）
+> **还没有在运行中的 DSH 里点过**。发布前至少走一遍：完整重启 DSH → 会话右上角
+> 「迁移工作区」→「选择文件夹…」应拉起系统对话框；对话框顶部**不应**出现红字
+> 「宿主那半边还是旧代码」（那说明宿主路由没加载）。
 
 ## 1. 构建与自检
 
@@ -58,8 +65,13 @@ npm pack --dry-run
 ```
 
 应包含：`lib/`、`parts/`、`build.mjs`、`cordis.patch.yml`、`LICENSE`、`NOTICE.md`、`README.md`、
-`CHANGELOG.md`、`RELEASE.md`（当前共 50 个文件，约 360 kB）。
+`CHANGELOG.md`、`RELEASE.md`（当前共 51 个文件，约 381 kB）。
 `parts/*/package.json`、上游 README/CHANGELOG 会一并打进 `parts/`（保留归属，符合 MIT）。
+
+> **本机用 pnpm 代替 npm 时**：`pnpm pack --pack-destination <空目录>` 产出的 tgz 里，
+> `package.json` 会被 pnpm **重新序列化**（缩进变化、`prepublishOnly` 被剥离）——
+> 与工作区的 `package.json` 哈希不一致是正常的；`lib/client.js` / `lib/index.js` 的哈希
+> **必须**与工作区一致（0.2.11 实测一致）。
 
 ## 3. 发布
 
