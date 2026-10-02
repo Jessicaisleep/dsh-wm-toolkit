@@ -79,7 +79,7 @@ export function encodeSegment(raw) {
  * 会话日志文件名：DSH 从 v0 一路走到 v4，目录里实际写着哪一代取决于会话创建的版本。
  * 只认 v3 会把 v4 会话当成「没有日志」整个跳过——迁移于是**静默失效**。
  */
-const LOG_NAMES = ['session.v4.jsonl.zstd', 'session.v3.jsonl.zstd', 'session.v2.jsonl.zstd', 'session.jsonl.zstd', 'session.jsonl'];
+export const LOG_NAMES = ['session.v4.jsonl.zstd', 'session.v3.jsonl.zstd', 'session.v2.jsonl.zstd', 'session.jsonl.zstd', 'session.jsonl'];
 
 /** 在会话目录里找实际存在的日志文件（返回文件名与完整路径），没有则 undefined。 */
 export function findSessionLog(dir) {

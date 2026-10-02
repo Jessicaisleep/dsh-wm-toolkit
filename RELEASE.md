@@ -1,6 +1,6 @@
 # RELEASE.md — 发布清单
 
-包名 `dsh-wm-toolkit`（2026-09-18 首发 `0.1.0`），当前版本 `0.2.11`。
+包名 `dsh-wm-toolkit`（2026-09-18 首发 `0.1.0`），当前版本 `0.2.12`。
 
 ## 0. 发布前的验证状态
 
@@ -24,10 +24,19 @@
 
 > 注意：客户端半边改动后需要**刷新页面**（Ctrl+Shift+R）才生效；宿主半边改动需要**重启 DSH**。
 
-> **`0.2.11` 尚未运行验证的部分**：新增的宿主路由
+> **`0.2.12` 修复的两处**（都已带回归测试）：
+> 1. **v4 会话被判成「没有磁盘记录」** —— 宿主两处硬编码日志文件名列表只列到 v3，
+>    `session.v4.jsonl.zstd` 被整个跳过，移动有内容的会话直接报错。现已统一走
+>    `wm-relocate.js` 导出的 `LOG_NAMES` 单一来源。回归测试
+>    `parts/manager/tests/wm-v4-artifact.test.mjs`。
+> 2. **`window.alert` 卡死所有输入框** —— Electron 原生模态阻塞渲染进程，点掉后
+>    DSH 输入框拿不回焦点。两处（右上角菜单报错、搬家完成提示）已改为非阻塞内联提示；
+>    同一套测试**禁止**客户端半边再出现 `window.alert`。
+
+> **`0.2.11` 新增、当时尚未运行验证的部分**：宿主路由
 > `GET /session-manager/api/workspace-migrate/capabilities`（只有重启 DSH 才会加载）与客户端
-> 的系统文件夹选择器（`ctx.inject(["remote","remote.directoryPicker"])` 提前取句柄）
-> **还没有在运行中的 DSH 里点过**。发布前至少走一遍：完整重启 DSH → 会话右上角
+> 的系统文件夹选择器（`ctx.inject(["remote","remote.directoryPicker"])` 提前取句柄）。
+> 已随 `0.2.11`/`0.2.12` 提交；若再遇到问题，先走一遍：完整重启 DSH → 会话右上角
 > 「迁移工作区」→「选择文件夹…」应拉起系统对话框；对话框顶部**不应**出现红字
 > 「宿主那半边还是旧代码」（那说明宿主路由没加载）。
 
@@ -37,7 +46,7 @@
 cd "D:\DSH工作区\DSH插件\dsh-wm-toolkit"
 
 node build.mjs          # 生成 lib/index.js + lib/client.js
-node tests/run-all.mjs  # 三半离线测试（当前 12 套：recall + manager + delete）
+node tests/run-all.mjs  # 三半离线测试（当前 14 套：recall + manager + delete）
 ```
 
 > 本机现在有 node（v24）/ npm（v11）。若哪台机器上没有，退回到 DSH 自带的 Node：

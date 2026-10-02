@@ -20,6 +20,7 @@ const suites = [
   { label: 'manager · 投影缓存 identity 对账', file: join(here, '..', 'parts', 'manager', 'tests', 'reconcile-projcache-identity.test.mjs') },
   { label: 'manager · 图标跨版本兼容（DSH 2.0 席位消失）', file: join(here, '..', 'parts', 'manager', 'tests', 'icon-compat.test.mjs') },
   { label: 'manager · 桥接会话 id 转义（删不掉/删了又回来）', file: join(here, '..', 'parts', 'manager', 'tests', 'wm-escaped-session-id.test.mjs') },
+  { label: 'manager · v4 会话工件（有内容却说没有磁盘记录 + 禁阻塞弹窗）', file: join(here, '..', 'parts', 'manager', 'tests', 'wm-v4-artifact.test.mjs') },
   { label: 'manager · 宿主冒烟', file: join(here, '..', 'parts', 'manager', 'tests', 'smoke-host.cjs') },
   { label: 'delete · 删除逻辑核心', file: join(here, '..', 'parts', 'delete', 'tests', 'wm-delete-logic.test.mjs') },
   { label: 'delete · 宿主集成（含官方 surface 契约验收）', file: join(here, '..', 'parts', 'delete', 'tests', 'wm-delete-host.test.mjs') },

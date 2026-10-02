@@ -31,7 +31,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { createDshAdapter } from "./compat/dsh-adapter.js";
 import { decompressAllZstdFrames } from "./compat/zstd-frames.js";
-import { deleteSessionFiles, encodeSegment, findSessionLog, listSessions, projectKey, purgeOrphanProjcache, readHeader, reconcileProjcacheForSession, reconcileProjcacheIdentity, relocateSessions } from "./wm-relocate.js";
+import { LOG_NAMES, deleteSessionFiles, encodeSegment, findSessionLog, listSessions, projectKey, purgeOrphanProjcache, readHeader, reconcileProjcacheForSession, reconcileProjcacheIdentity, relocateSessions } from "./wm-relocate.js";
 
 export const name = "dsh-session-manager-wm";
 
@@ -175,7 +175,10 @@ const listSessionHeaders = async (persistence, dshHome) => {
       if (!entry.isDirectory()) continue;
       // Cheap directory-name skip -- the issue #6 hot path fix.
       if (knownDirs.has(entry.name)) continue;
-      for (const filename of ["session.v3.jsonl.zstd", "session.v2.jsonl.zstd", "session.jsonl.zstd", "session.jsonl"]) {
+      // 会话日志文件名必须走 LOG_NAMES 单一来源：这里以前硬编码到 v3，于是
+      // `session.v4.jsonl.zstd` 的会话在磁盘兜底里被整个跳过 —— 明明有内容却
+      // 被判成「没有磁盘记录」。同类错误已在 wm-relocate.js 犯过一次。
+      for (const filename of LOG_NAMES) {
         const filePath = join(root, proj.name, entry.name, filename);
         try {
           const buf = await readFile(filePath);
@@ -1202,7 +1205,8 @@ ${rest}`, "utf8");
         if (!proj.isDirectory()) continue;
         for (const candidate of [encoded, sessionId]) {
           const dir = join(root, proj.name, candidate);
-          for (const filename of ["session.jsonl.zstd", "session.v2.jsonl.zstd", "session.v3.jsonl.zstd", "session.jsonl"]) {
+          // 同 listSessionHeaders：文件名走 LOG_NAMES，别再硬编码世代。
+          for (const filename of LOG_NAMES) {
             const filePath = join(dir, filename);
             try {
               const buf = await readFile(filePath);
