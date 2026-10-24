@@ -61,10 +61,26 @@ function makeFakeReact() {
   };
 }
 
+/**
+ * 语言环境：wmZh() 读 navigator.language / document.documentElement 的 lang，
+ * 都拿不到才 catch 成中文。Node 的 navigator.language 跟着**跑测机器**走 ——
+ * Windows 中文机是 zh-CN，CI（ubuntu-latest，LANG=C.UTF-8）是 en-US ——
+ * 于是「文案是中文」这条断言本地过、CI 挂（2026-10-25 真事：v0.2.13 首发
+ * 就死在这一条）。这里把语言钉成可切换的假环境，断言与机器无关。
+ */
+const fakeEnv = { lang: 'zh-CN' };
+
+function setFakeLanguage(lang) {
+  fakeEnv.lang = lang;
+  Object.defineProperty(globalThis, 'navigator', {
+    value: { language: lang }, configurable: true, writable: true,
+  });
+}
+
 function makeFakeDocument() {
   const node = () => ({
     style: {}, dataset: {}, children: [], firstChild: null, parentElement: null,
-    appendChild() {}, removeChild() {}, remove() {}, setAttribute() {}, getAttribute() { return null; },
+    appendChild() {}, removeChild() {}, remove() {}, setAttribute() {}, getAttribute(name) { return name === 'lang' ? fakeEnv.lang : null; },
     removeAttribute() {}, addEventListener() {}, removeEventListener() {}, append() {},
     querySelector() { return null; }, querySelectorAll() { return []; },
     classList: { add() {}, remove() {}, contains() { return false; }, toggle() {} },
@@ -143,6 +159,9 @@ function labelOf(button) {
 
 // ---------------------------------------------------------------- 行为层
 
+// 先钉死语言环境，再加载半边（渲染时才会读 navigator，但钉早一点更稳）。
+setFakeLanguage('zh-CN');
+
 const face = await loadFace(managerClient, PRIMITIVES);
 const registrations = [];
 face.apply(makeCtx(registrations));
@@ -214,6 +233,14 @@ check('侧栏菜单行渲染成官方 MenuItemButton，文案是「迁移工作�
   assert.equal(tree.type, PRIMITIVES.MenuItemButton, '必须用官方行原语（菜单里其它行也是它）');
   assert.deepEqual(tree.children, ['迁移工作区'], '中文环境下文案应取中文字典项');
   assert.ok(tree.props.icon, '必须带图标（解析不到也不许是 undefined 组件）');
+});
+
+check('行文案随语言切换（zh → 迁移工作区 / en → Migrate workspace），与跑测机器无关', () => {
+  setFakeLanguage('zh-CN');
+  assert.deepEqual(renderMenuRow().tree.children, ['迁移工作区'], 'zh 环境应取中文字典项');
+  setFakeLanguage('en-US');
+  assert.deepEqual(renderMenuRow().tree.children, ['Migrate workspace'], 'en 环境应取英文字典项');
+  setFakeLanguage('zh-CN');
 });
 
 check('点侧栏菜单行：先关菜单再开对话框，且不抛错', () => {
