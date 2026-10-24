@@ -107,12 +107,18 @@ DSH 的插件列表按**包 / 插件 id** 逐行列出的，所以"装上去就�
 
 ## 兼容性
 
-- 目标：DeepSeek Harness（`dsh`）Web 端，`engines.dsh >= 0.1.5-rc.1`；Node ≥ 22。
+- 目标：DeepSeek Harness（`dsh`）Web 端，`engines.dsh ^0.1.5-rc.1 || ^0.2.0-rc.1 || ^0.2.1-rc.1`；Node ≥ 22。
+  （写成显式 `||` 分支而不是 `>=0.1.5-rc.1`：node-semver 只放行「范围内某个比较符与该版本的
+  `major.minor.patch` 元组一致、且自身带预发布标签」的预发布版，宽泛的 `>=0.1.5-rc.1`
+  在 `0.2.1` 元组上没有带预发布标签的比较符，会**静默排除**整个 0.2.x 预发布线。）
 - 只使用 DSH 官方扩展点与公开服务（`webServer` / `sessions` / `agents` / `sessionPersistence` /
   `workspaceRegistry` / `agentPresets` / `settings` / `storageDomain` / `sessionQuery`），
   不修改引擎与官方 UI 包。
 - 删除功能走官方 `surfaceOp: { op: 'replace' }` 契约（与 `/compact` 同一套机制），
   已在 DSH `0.1.5-rc.2` 上用官方 `foldSurface` 做过契约回归。
+- 已在 **DSH `0.2.1-rc.3`**（Windows / Web 端）实测：三半正常加载，撤回 / 编辑 / 重新生成 /
+  删除 / 会话管理与工作区迁移均可用；rc.3 起工作区迁移的入口是左侧栏面板列表的「更多」菜单
+  （`sidebar.panellist.actions`），会话右上角不再有它。
 - 与侧边栏、皮肤、记忆、导出类插件无冲突；**不要**与另一个跨工作区移动器或另一个消息删除插件同时启用。
 
 ## 已知边界（诚实说明）

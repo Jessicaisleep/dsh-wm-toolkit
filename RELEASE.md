@@ -1,6 +1,6 @@
 # RELEASE.md — 发布清单
 
-包名 `dsh-wm-toolkit`（2026-09-18 首发 `0.1.0`），当前版本 `0.2.12`。
+包名 `dsh-wm-toolkit`（2026-09-18 首发 `0.1.0`），当前版本 `0.2.13`。
 
 ## 0. 发布前的验证状态
 
@@ -24,6 +24,21 @@
 
 > 注意：客户端半边改动后需要**刷新页面**（Ctrl+Shift+R）才生效；宿主半边改动需要**重启 DSH**。
 
+> **`0.2.13` 的改动（纯 UI，只动客户端半边）**：会话标题栏
+> （`conversation.session.header.actions`）原来并排三个按钮，现在只留「删除会话」；
+> 归档与移动回到侧边栏「会话管理」面板逐行操作。回归测试
+> `parts/manager/tests/header-actions.test.mjs`（已登记进 `tests/run-all.mjs`，现 15 套）。
+> 验收只需**刷新页面**（Ctrl+Shift+R，客户端半边改动不用重启 DSH）：标题栏应只剩一个红字删除按钮。
+>
+> **同时并入的 DSH 0.2.1-rc.3 适配**：「迁移工作区」从会话右上角工具区
+> （`conversation.session.header.utilities`）挪进 rc.3 新增的左侧栏面板列表「更多」菜单
+> （`sidebar.panellist.actions`，`order: 100`，排在官方「浏览更多插件 / 创建你的插件」下面），
+> 会话右上角那条注册整块删除、`WmMigrateEntry` 一并清掉；
+> `engines.dsh` 改为 `^0.1.5-rc.1 || ^0.2.0-rc.1 || ^0.2.1-rc.1`（原 `>=0.1.5-rc.1`
+> 匹配不到任何 0.2.x 预发布版，rc.3 会被静默排除）。
+> 验收：刷新页面 → 左侧栏面板列表的「更多」里应多一行「迁移工作区」，
+> 会话右上角应**没有**它。
+
 > **`0.2.12` 修复的两处**（都已带回归测试）：
 > 1. **v4 会话被判成「没有磁盘记录」** —— 宿主两处硬编码日志文件名列表只列到 v3，
 >    `session.v4.jsonl.zstd` 被整个跳过，移动有内容的会话直接报错。现已统一走
@@ -46,7 +61,7 @@
 cd "D:\DSH工作区\DSH插件\dsh-wm-toolkit"
 
 node build.mjs          # 生成 lib/index.js + lib/client.js
-node tests/run-all.mjs  # 三半离线测试（当前 14 套：recall + manager + delete）
+node tests/run-all.mjs  # 三半离线测试（当前 15 套：recall + manager + delete）
 ```
 
 > 本机现在有 node（v24）/ npm（v11）。若哪台机器上没有，退回到 DSH 自带的 Node：
@@ -93,7 +108,7 @@ npm pack --dry-run
 > tag 与版本一致性校验 / `build.mjs` / `run-all.mjs` / `npm publish` 全部 ✔），
 > §3.1 的 Trusted Publisher 早已绑定，**不需要任何 token**。
 >
-> 已发布版本：`0.1.0`（手工）、`0.2.5`、`0.2.6`、`0.2.7`、`0.2.9`、`0.2.10`（CI）。
+> 已发布版本：`0.1.0`（手工）、`0.2.5`、`0.2.6`、`0.2.7`、`0.2.9`、`0.2.10`、`0.2.11`、`0.2.12`（CI）。
 > （`0.2.8` 从未发布；它的修复包含在 `0.2.9` 里，跟 `latest` 的用户无关。）
 >
 > 所以现在的发版流程就是**一条链**：**升版本 + 打 tag + push**，npm 和 Git 一起更新。
