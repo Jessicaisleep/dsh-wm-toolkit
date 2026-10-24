@@ -15,6 +15,7 @@ const suites = [
   { label: 'recall · 编辑/重生成核心', file: join(here, '..', 'parts', 'recall', 'tests', 'wm-assistant-edit.test.mjs') },
   { label: 'recall · fork 复活队列清理（纯逻辑）', file: join(here, '..', 'parts', 'recall', 'tests', 'purge-resurrected-queue.test.mjs') },
   { label: 'recall · fork 复活队列清理（宿主集成）', file: join(here, '..', 'parts', 'recall', 'tests', 'purge-queue-host.test.mjs') },
+  { label: 'recall · 消息图片渲染 + 诊断日志上限（rc.3 适配）', file: join(here, '..', 'parts', 'recall', 'tests', 'message-images.test.mjs') },
   { label: 'manager · 会话迁移核心', file: join(here, '..', 'parts', 'manager', 'tests', 'wm-relocate.test.mjs') },
   { label: 'manager · 孤儿投影缓存清理（损坏会话删不掉）', file: join(here, '..', 'parts', 'manager', 'tests', 'purge-orphan-projcache.test.mjs') },
   { label: 'manager · 投影缓存 identity 对账', file: join(here, '..', 'parts', 'manager', 'tests', 'reconcile-projcache-identity.test.mjs') },

@@ -9,7 +9,7 @@
  *
  * 依赖服务：webServer（路由）、sessions（fork/flush）。
  */
-import { appendFile, mkdir, writeFile, rm, readFile, readdir } from 'node:fs/promises';
+import { appendFile, mkdir, writeFile, rm, readFile, readdir, stat, rename } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { execFile } from 'node:child_process';
@@ -36,6 +36,28 @@ function resolveLogFile() {
 }
 function ts() { return new Date().toISOString(); }
 
+// ---------- 日志体积上限（v2.6.0） ----------
+// 此前是纯 appendFile、无任何上限：一条「有图消息每次重渲染都写一行」的警告把文件顶到了
+// 11.1 MB / 63,102 行（其中 59,789 行是同一条 attach 警告）。现策：单文件超过 MAX_LOG_BYTES
+// 就轮转为 <file>.1（旧 .1 直接丢弃），只保留一代，磁盘占用有界（≈ 2 × 上限）。
+const MAX_LOG_BYTES = 4 * 1024 * 1024;
+let logBytes = null; // 已知的文件字节数；首次写入时用 stat 初始化
+
+async function currentLogBytes(file) {
+  if (logBytes !== null) return logBytes;
+  try { logBytes = (await stat(file)).size; } catch (e) { logBytes = 0; }
+  return logBytes;
+}
+
+/** 超出上限就把当前文件轮转成 .1。轮转失败（文件被占用等）不抛，只把记账归零继续追加。 */
+async function rotateLogIfNeeded(file, incoming) {
+  const size = await currentLogBytes(file);
+  if (size + incoming <= MAX_LOG_BYTES) return;
+  try { await rm(file + '.1', { force: true }); } catch (e) { /* 旧世代不存在也算成功 */ }
+  try { await rename(file, file + '.1'); } catch (e) { /* 占用则放弃本次轮转 */ }
+  logBytes = 0;
+}
+
 /** 批处理自驱式落盘（彻底杜绝无界 Promise 链与闭包泄漏，合并 IO 提升吞吐）。 */
 async function flushLogBuffer() {
   if (isFlushing) return;
@@ -48,8 +70,11 @@ async function flushLogBuffer() {
       // 批量取出当前积攒的全部日志行
       const batch = logBuffer.splice(0, logBuffer.length);
       const content = batch.map((item) => item.line).join('\n') + '\n';
+      const bytes = Buffer.byteLength(content, 'utf8');
       try {
+        await rotateLogIfNeeded(file, bytes);
         await appendFile(file, content, 'utf8');
+        logBytes = (logBytes ?? 0) + bytes;
       } catch (e) {
         // 单次 IO 异常不抛，避免破坏进程
       }

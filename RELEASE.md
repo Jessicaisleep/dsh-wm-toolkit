@@ -1,6 +1,6 @@
 # RELEASE.md — 发布清单
 
-包名 `dsh-wm-toolkit`（2026-09-18 首发 `0.1.0`），当前版本 `0.2.13`。
+包名 `dsh-wm-toolkit`（2026-09-18 首发 `0.1.0`），当前版本 `0.2.14`。
 
 ## 0. 发布前的验证状态
 
@@ -24,10 +24,24 @@
 
 > 注意：客户端半边改动后需要**刷新页面**（Ctrl+Shift+R）才生效；宿主半边改动需要**重启 DSH**。
 
+> **`0.2.14` 修的两处（都带回归测试；图片那处只动客户端半边，日志上限动宿主半边）**：
+> 1. **rc.3 起带图片附件的用户消息不显示图片** —— rc.3 不再注入 `renderMessageImages`
+>    （该串在 `app.asar` 里命中 0 次），官方槽 `conversation.chat.user.images` 是 `single` +
+>    `replaceRisk: shadows-shipped-ui`，第三方占了会顶掉全 App 的官方图片组件。改用
+>    chat.node 下发的 `loadImage` 自绘宫格：首帧走消息块自带的 `preview.url` 或
+>    `loadImage.peek()` 缓存，都没命中先显示「图片加载中…」占位，失败可点重试，点图开
+>    已有的 `ImageLightbox`；旧宿主若仍注入 `renderMessageImages` 则**优先直调官方实现**。
+> 2. **诊断日志被同一条 `attach` 警告刷到 11.1 MB**（63,102 行里 59,789 行是它）—— 客户端
+>    半边新增 `logOnce`（同类事件每进程只上报一次），宿主半边加日志体积上限
+>    `MAX_LOG_BYTES = 4 MiB`，超限轮转为 `.log.1`（只留一代）。
+> 回归测试 `parts/recall/tests/message-images.test.mjs`（已登记进 `tests/run-all.mjs`，现 16 套）。
+> 验收：**刷新页面**（Ctrl+Shift+R）后发一条带图的指令 —— 缩略图应显示、点开有原图预览；
+> **日志上限要重启 DSH** 才生效（宿主半边）。
+
 > **`0.2.13` 的改动（纯 UI，只动客户端半边）**：会话标题栏
 > （`conversation.session.header.actions`）原来并排三个按钮，现在只留「删除会话」；
 > 归档与移动回到侧边栏「会话管理」面板逐行操作。回归测试
-> `parts/manager/tests/header-actions.test.mjs`（已登记进 `tests/run-all.mjs`，现 15 套）。
+> `parts/manager/tests/header-actions.test.mjs`（已登记进 `tests/run-all.mjs`，发布时 15 套）。
 > 验收只需**刷新页面**（Ctrl+Shift+R，客户端半边改动不用重启 DSH）：标题栏应只剩一个红字删除按钮。
 >
 > **同时并入的 DSH 0.2.1-rc.3 适配**：「迁移工作区」从会话右上角工具区
@@ -108,7 +122,7 @@ npm pack --dry-run
 > tag 与版本一致性校验 / `build.mjs` / `run-all.mjs` / `npm publish` 全部 ✔），
 > §3.1 的 Trusted Publisher 早已绑定，**不需要任何 token**。
 >
-> 已发布版本：`0.1.0`（手工）、`0.2.5`、`0.2.6`、`0.2.7`、`0.2.9`、`0.2.10`、`0.2.11`、`0.2.12`（CI）。
+> 已发布版本：`0.1.0`（手工）、`0.2.5`、`0.2.6`、`0.2.7`、`0.2.9`、`0.2.10`、`0.2.11`、`0.2.12`、`0.2.13`（CI）。
 > （`0.2.8` 从未发布；它的修复包含在 `0.2.9` 里，跟 `latest` 的用户无关。）
 >
 > 所以现在的发版流程就是**一条链**：**升版本 + 打 tag + push**，npm 和 Git 一起更新。

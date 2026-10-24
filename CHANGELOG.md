@@ -4,6 +4,40 @@
 半边各自的详细变更史保留在 `parts/recall/CHANGELOG-WM.md` 与 `parts/manager/CHANGELOG.md`；
 本文件只记录**面向使用者**的包级版本。
 
+## 0.2.14 — 2026-10-25
+
+### 修：DSH 0.2.1-rc.3 起，带图片附件的用户消息一张图都不显示
+
+rc.3 把用户消息图片改成了官方槽渲染，同时**不再往 `conversation.chat.node` 注入
+`renderMessageImages`**（该串在整个 `app.asar` 里命中 0 次）。撤回半边顶替的正是那个
+用户消息格，拿不到官方渲染器就什么都不画 —— 缩略图、宫格、原图预览全都没了。
+
+官方留下的槽 `conversation.chat.user.images` 是 `single` + `replaceRisk: shadows-shipped-ui`，
+第三方注册会**顶掉全 App 的官方图片组件**，不能占。所以改用 chat.node ownerProps 明确下发的
+`loadImage`（`(attachment) => Promise<url>`，带 `.peek()` 查缓存）自绘宫格：
+
+- 首帧就能出图的两种来源：消息块自带的 `preview.url`（本地回显）、`loadImage.peek()` 命中缓存；
+- 两个都没命中时先渲染「图片加载中…」占位，异步拿到地址再换成 `<img>`；
+- 加载失败变成可点重试的占位，不再静默空着；
+- 点图开本插件已有的 `ImageLightbox` 看原图；
+- **旧宿主仍然优先**：只要还注入 `renderMessageImages`，就照旧直调官方实现。
+
+回归测试 `parts/recall/tests/message-images.test.mjs`（已登记进 `tests/run-all.mjs`，现 16 套）：
+覆盖 rc.3 自绘路径、preview 首帧直出、peek 缓存首帧直出、加载中占位、旧宿主优先、
+两者都没有时不抛错。
+
+### 修：诊断日志被一条警告刷爆（11.1 MB）
+
+`dsh-message-recall-wm.log` 一度涨到 **11.1 MB / 63,102 行**，其中 **59,789 行（94.7%）是同一条**
+`attach` 警告「renderMessageImages prop 缺失（官方注入面变化？），图片无法渲染」——它写在
+「这条消息确实带图」判断之后，每次重渲染都落一行，7 天写了 5.98 万行。
+
+- 客户端半边新增 `logOnce(key, …)`：同类事件只上报一次（那条警告现在每进程最多一行）。
+- 宿主半边给日志加了**体积上限**：`MAX_LOG_BYTES = 4 MiB`，超过就把现役文件轮转成 `.log.1`
+  （只保留一代，旧 `.1` 直接覆盖），再写新行 —— 不会再无限增长。
+
+> 升级后可以直接删掉旧的 `$DSH_HOME\dsh-message-recall-wm.log`：全仓只有写、没有读回，删了不影响任何功能。
+
 ## 0.2.13 — 2026-10-25
 
 ### 改：会话标题栏只保留「删除会话」一个按钮
