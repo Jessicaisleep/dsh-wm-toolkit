@@ -342,6 +342,49 @@ export function isOwnPlaceholder(event) {
 }
 
 /**
+ * 一条 assistant/message 在转录上**有没有可见文本**。
+ *
+ * 为什么要判这个：纯工具调用的步骤会落一条文本为空的 assistant/message（只有 tool/call）。
+ * 转录上它不是一条助手气泡，而是被渲染成工具卡或「已完成分析」那种折叠分组行。
+ * 把"删除这段回复"按钮挂到这种行上，按钮就藏进折叠壳里 ——
+ * 用户看到的现象是"这一段删不掉、根本没有删除按钮"。
+ *
+ * @param event - 原始会话事件。
+ * @returns 有任何非空白文本片段返回 true。
+ */
+export function hasVisibleText(event) {
+  if (!event || event.type !== 'assistant/message') return false;
+  const message = event.data && event.data.message;
+  const content = message && Array.isArray(message.content) ? message.content : [];
+  for (const part of content) {
+    if (!part || typeof part !== 'object') continue;
+    if (part.type !== 'text') continue;
+    if (typeof part.text === 'string' && part.text.trim() !== '') return true;
+  }
+  return false;
+}
+
+/**
+ * 这一段的「段尾行」应该落在哪个 surface seq 上。
+ *
+ * 优先取**最后一个有可见文本的 assistant/message**；整段都没有文本时（纯工具调用段）
+ * 回落到该段最后一个 assistant，再不行回落到段尾节点本身 —— 保证按钮总有可见的落点。
+ *
+ * @param segment - replySegments 内部构造出来的段。
+ * @param shadowed - 该段遮蔽的 surface seq 列表。
+ * @param bySeq - seq → event 查表。
+ * @returns surface seq。
+ */
+function pickVisibleTail(segment, shadowed, bySeq) {
+  const assistants = segment.assistantSeqs;
+  for (let i = assistants.length - 1; i >= 0; i -= 1) {
+    if (hasVisibleText(bySeq.get(assistants[i]))) return assistants[i];
+  }
+  if (assistants.length > 0) return assistants[assistants.length - 1];
+  return shadowed[shadowed.length - 1];
+}
+
+/**
  * 把一个回合的 surface 内容切成「回复段」。
  *
  * 一个回合里可以有多条真人提问——除了开场那条，还有你在 agent 干活途中补发的
@@ -406,6 +449,11 @@ export function replySegments(events, surfaceNodes, turn) {
       shadowed,
       seqs: segment.seqs,
       assistantSeqs: segment.assistantSeqs,
+      // 每个 assistant 在这段里**有没有可见文本**（见 hasVisibleText）。
+      // `tailSeq` 取"最后一个有文本的 assistant"，没有就回落到段尾的可见行：
+      // 空文本 assistant 在转录上是工具卡 / 过程分组，把按钮挂上去等于藏进折叠壳里。
+      assistantText: segment.assistantSeqs.map((seq) => hasVisibleText(bySeq.get(seq))),
+      tailSeq: pickVisibleTail(segment, shadowed, bySeq),
       clean: !shadowed.some((seq) => !memberSet.has(seq) && !isOwnPlaceholder(bySeq.get(seq))),
     };
   });
@@ -439,6 +487,27 @@ export function planRange(events, surfaceNodes, request) {
   const bySeq = new Map(events.map((event) => [event.seq, event]));
   const nodeIndex = new Map(surfaceNodes.map((seq, index) => [seq, index]));
   const turnOf = turnIndex(events);
+
+  /**
+   * 窗口不得覆盖 surface 节点 0（系统提示词头）。
+   *
+   * 头本身是 `system/message`，已经被 `replySegments` / 成员筛选排除在外，所以正常
+   * 情况下碰不到它。但**宿主每轮都重写这个头**，重写后它带的是**当前轮号**；一旦它
+   * 因为被遮蔽等原因不再位于节点 0，按 seq 找"该轮成员"就可能把窗口一路推到节点 0，
+   * 于是替换区间从头开始 —— 官方 append 契约只允许用 `system/message` 精确改写节点 0，
+   * 而删除用的载体是 turn-less 的 `user/message`，这样的窗口会被拒绝或改写错误的节点。
+   *
+   * 所以判据必须是**窗口起点**，不是"头所在轮"（上游 dsh-delete-turn 0.1.12 的修法，
+   * 真实会话上复现过：旧判据「头所在轮不可删」会误拒当前轮）。
+   *
+   * @param startSeq - 窗口的第一个 surface seq。
+   */
+  const assertWindowOffHead = (startSeq) => {
+    if (surfaceNodes.length === 0) return;
+    if (startSeq === surfaceNodes[0]) {
+      throw new PlanError('not-deletable', 'the window would cover the system prompt head');
+    }
+  };
 
   let targetSeq = typeof request.seq === 'number' ? request.seq : undefined;
   if (targetSeq === undefined && typeof request.messageId === 'string' && request.messageId !== '') {
@@ -522,6 +591,7 @@ export function planRange(events, surfaceNodes, request) {
     const indexes = members.map((seq) => nodeIndex.get(seq));
     const startIdx = Math.min(...indexes);
     const endIdx = Math.max(...indexes);
+    assertWindowOffHead(surfaceNodes[startIdx]);
     const shadowed = surfaceNodes.slice(startIdx, endIdx + 1);
     if (shadowed.some((seq) => !memberSet.has(seq) && !isOwnPlaceholder(bySeq.get(seq)))) {
       throw new PlanError('range-not-clean', 'the step window contains unrelated surface nodes');
@@ -552,6 +622,11 @@ export function planRange(events, surfaceNodes, request) {
     const scope = wholeTurn ? 'turn' : 'segment';
     let chosen = segments;
     if (scope === 'segment') {
+      // 目标属于哪一段就删哪一段（**整段**，不是它自己那一个节点）。
+      // 官方助手操作条用 messageId 定位到的是"那条回复"，而段是提问切出来的连续区间：
+      // 只删单节点会把段劈成两半（前半截留在上下文、后半截被遮蔽）。所以这里统一
+      // 归一到 owner 整段。一轮只有 1 段时，"删这一段"就等于"删这一轮的 AI 回复"，
+      // 提问仍然保留 —— 这是语义必然，不是把范围放大到整轮。
       const owner = segments.find((segment) => segment.seqs.includes(targetSeq));
       if (owner === undefined) throw new PlanError('not-deletable', 'the target is not part of a reply segment');
       chosen = [owner];
@@ -561,6 +636,9 @@ export function planRange(events, surfaceNodes, request) {
     }
 
     const ranges = chosen.map((segment) => ({ startSeq: segment.startSeq, endSeq: segment.endSeq, shadowed: segment.shadowed }));
+    // 每一段窗口的**起点**都不能是节点 0：整轮删除走的就是这条路径（目标可以已离场），
+    // 窗口完全由 replySegments 算出来，所以必须在这里拦，而不是只拦被点的那个目标。
+    for (const range of ranges) assertWindowOffHead(range.startSeq);
     const shadowed = ranges.flatMap((range) => range.shadowed);
     const closing = bySeq.get(ranges[ranges.length - 1].endSeq);
     const step = closing && closing.type === 'assistant/message' && typeof closing.data.step === 'number' ? closing.data.step : 0;

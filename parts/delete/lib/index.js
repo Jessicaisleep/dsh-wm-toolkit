@@ -22,10 +22,11 @@
  * 移植自 MIT 社区插件 `dsh-delete-turn`（DDDMUC/dsh-delete-turn v0.1.3）的 src/index.js，
  * 路由前缀、守卫与清理方式改为与本仓库其他半边一致的写法。上游版权见仓库根 NOTICE.md。
  */
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, renameSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   PLUGIN_ID,
@@ -35,6 +36,8 @@ import {
   foldSurface,
   hiddenEntriesOfFold,
   isBusy,
+  messageIdOf,
+  openTurn,
   planRange,
   pluginSource,
   replySegments,
@@ -71,17 +74,122 @@ function isSupportedSessionId(value) {
 
 const MODES = new Set(['message', 'step', 'reply']);
 
+// 生成中删除 = **先停这一轮、再删**。
+//
+// 官方入口是 sessionController.cancel（它解析出 live Agent 并调
+// `agent.cancel({ kind: 'user' }, { keepInbox: true })`），所以排队的输入会保留，
+// 只中断正在跑的那一轮。但 cancel 只是**受理**：循环还要继续收尾 —— provider 流被取消、
+// 已开始的工具调用按序提交结果、残缺答案以 `interrupted: true` 落地、`turn/end` 追加
+// 并 flush。所以必须轮询日志，等这一轮**真的闭合**之后再规划窗口；否则 surface 还会动，
+// 规划出来的 seq 立刻过期（表现为随机 stale / 甚至遮蔽到别的节点）。
+// 预算从 15s 提到 60s：本机实测（session-8c5d8123，2026-10-27 23:25–23:30）连续 5 次
+// 生成中删除都在 15 秒内等不到 `turn/end`，全部落到 `stop-timeout` —— 流式生成 + 工具
+// 调用收尾的真实耗时远超上游假设的 15 秒。60 秒覆盖绝大多数收尾；仍超时就明确告诉用户
+// "还没停完，可以再试或先手动点停止"，而不是让他对着一个语焉不详的失败发呆。
+const STOP_TIMEOUT_MS = 60000;
+const STOP_POLL_MS = 250;
+let stopWait = { timeoutMs: STOP_TIMEOUT_MS, pollMs: STOP_POLL_MS };
+
+/**
+ * 覆盖"先停后删"的等待预算。生产用默认值；测试把它调小，让超时分支跑得便宜。
+ * @param options - `{ timeoutMs?, pollMs? }`。
+ */
+export function configureStopWait(options) {
+  stopWait = {
+    timeoutMs: options && typeof options.timeoutMs === 'number' ? options.timeoutMs : STOP_TIMEOUT_MS,
+    pollMs: options && typeof options.pollMs === 'number' ? options.pollMs : STOP_POLL_MS,
+  };
+}
+
 // ---------------------------------------------------------------- 日志
 
-/** 落盘日志：删除是不可逆操作，失败必须留痕（DSH 宿主日志只看得到 load 失败）。 */
-function logLine(level, message, data) {
+/**
+ * 日志体积上限。超过就把现役文件轮转成 `.log.1`（只留一代，旧的直接覆盖），再写新行。
+ *
+ * 为什么需要：这文件是**只追加**的，每次 apply 都会写一条「已注册」，测试还会写进
+ * 拒绝记录。实测 3 000+ 行 / 700 KB 里混着成批的测试数据，排查线上问题时非常容易被
+ * 带偏（与 0.2.14 给 recall 日志加 4 MiB 轮转是同一个思路）。
+ */
+const MAX_LOG_BYTES = 4 * 1024 * 1024;
+
+/**
+ * 进程内只写一次的键（降噪：每次 apply 都写「已注册」会把日志刷爆）。
+ *
+ * 键里带**日志目录**：同一个进程里若 `DSH_HOME` 变了（测试反复改指向、或多 profile
+ * 实例），新目录仍然需要它自己的那一条「已注册」——只按消息去重会让那些目录永远空白。
+ */
+const loggedOnce = new Set();
+
+/**
+ * 记录日志的归属目录（`$DSH_HOME`）。
+ *
+ * **不能**在模块顶层缓存：测试会反复改 `process.env.DSH_HOME` 指向不同的临时目录，
+ * 缓存了就会一直往第一次那个目录写（表现：后续用例的日志全空）。
+ */
+function logHome() {
+  return process.env.DSH_HOME || join(homedir(), '.dsh');
+}
+
+/** 本插件版本（首次注册时写进日志，便于对齐「这条记录是哪一版写的」）。 */
+const PLUGIN_VERSION = readPackageVersion();
+
+function readPackageVersion() {
   try {
-    const home = process.env.DSH_HOME || join(homedir(), '.dsh');
-    appendFileSync(
-      join(home, 'dsh-wm-delete.log'),
-      JSON.stringify({ t: new Date().toISOString(), level, plugin: PLUGIN_ID, message, data: data ?? null }) + '\n',
-      'utf8',
-    );
+    // 本文件在 `<包根>/parts/delete/lib/index.js`，包根的 package.json 要往上走三级：
+    //   lib → parts/delete → parts → <包根>
+    // 只走两级会读到 `parts/delete/package.json`（那是**上游**的 0.1.0，不是本包的版本）——
+    // 日志里曾经因此记成 "version":"0.1.0"，看起来像"装错了包"。
+    const here = dirname(fileURLToPath(import.meta.url));
+    const raw = readFileSync(join(here, '..', '..', '..', 'package.json'), 'utf8');
+    const parsed = JSON.parse(raw);
+    return typeof parsed.version === 'string' ? parsed.version : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+/** 现役日志超过上限就轮转到 `.log.1`（只保留一代）。 */
+function rotateLogIfNeeded(file) {
+  try {
+    if (!existsSync(file)) return;
+    const size = statSync(file).size;
+    if (size < MAX_LOG_BYTES) return;
+    renameSync(file, `${file}.1`);
+  } catch {
+    /* 轮转失败不阻塞写入 */
+  }
+}
+
+/**
+ * 落盘日志：删除是不可逆操作，失败必须留痕（DSH 宿主日志只看得到 load 失败）。
+ *
+ * @param next -
+ *   `onceKey`：同一进程内相同键只写一次（用于「已注册」这类每次 apply 都会触发、
+ *   但内容不变的记录）；
+ *   `test`：来自离线测试（测试会设 `WM_DELETE_TEST=1`），写进日志时带 `test: true`，
+ *   排查线上问题时一眼能把假数据摘出去。
+ */
+function logLine(level, message, data, next) {
+  try {
+    const options = next ?? {};
+    const home = logHome();
+    if (typeof options.onceKey === 'string') {
+      // 键带上日志目录：换了 DSH_HOME 就是"另一个日志文件"，它需要自己的一条记录。
+      const key = `${home}\u0000${options.onceKey}`;
+      if (loggedOnce.has(key)) return;
+      loggedOnce.add(key);
+    }
+    const file = join(home, 'dsh-wm-delete.log');
+    rotateLogIfNeeded(file);
+    const record = {
+      t: new Date().toISOString(),
+      level,
+      plugin: PLUGIN_ID,
+      message,
+      data: data ?? null,
+    };
+    if (process.env.WM_DELETE_TEST === '1' || options.test === true) record.test = true;
+    appendFileSync(file, JSON.stringify(record) + '\n', 'utf8');
   } catch {
     /* 日志失败不影响功能 */
   }
@@ -240,11 +348,28 @@ async function stateOf(ctx, sessionId) {
   // 每一段的**段尾节点**（该段最后一个 assistant/message 的 seq）：浏览器半边只在段尾那一行
   // 挂「删除这段回复」按钮——每段恰好一个入口，段中间的行不重复长按钮。
   const segmentTails = [];
+  // 每段遮蔽的 surface seq：确认框出现时，浏览器半边据此给"将被删除的段落"加删除线，
+  // 让用户在落刀之前**看得见到底删哪些行**（不锁滚动，取消即消失）。
+  const segmentWindows = [];
   for (const turn of replyTurns) {
     const segments = replySegments(events, folded.nodes, turn);
     if (segments.length === 0) continue;
     segmentsByTurn[turn] = segments.length;
-    for (const segment of segments) segmentTails.push(segment.assistantSeqs[segment.assistantSeqs.length - 1] ?? segment.endSeq);
+    for (const segment of segments) {
+      // 段尾优先取"最后一个有可见文本的 assistant"（tailSeq）：空文本 assistant 在转录上
+      // 是工具卡 / 过程分组，把按钮挂上去就藏进折叠壳里了，表现为"这段没有删除按钮"。
+      segmentTails.push(typeof segment.tailSeq === 'number' ? segment.tailSeq : segment.endSeq);
+      segmentWindows.push({ turn, startSeq: segment.startSeq, endSeq: segment.endSeq, shadowed: segment.shadowed });
+    }
+  }
+  // surface seq → 该节点的 messageId。官方助手操作条只用 messageId 定位，
+  // 浏览器半边要靠这份映射把它换算成"落在哪一段"，否则官方槽点开的确认框划不到线
+  // （真机表现：底部按钮删得掉、但没有删除线；用户指令走 seq 所以正常）。
+  const messageIdsBySeq = {};
+  const byEventSeq = new Map(events.map((event) => [event.seq, event]));
+  for (const seq of folded.nodes) {
+    const id = messageIdOf(byEventSeq.get(seq));
+    if (typeof id === 'string' && id !== '') messageIdsBySeq[seq] = id;
   }
   return {
     hidden,
@@ -254,6 +379,8 @@ async function stateOf(ctx, sessionId) {
     replyTurns,
     segmentsByTurn,
     segmentTails,
+    segmentWindows,
+    messageIdsBySeq,
     // clearedTurns：已经被删空、只剩提问的回合。这些回合里"映射不到 surface 节点"的行
     // （过程分组壳、重试行、中断的工具行）必须按回合号整行收起，否则就是一堆删不掉的壳。
     clearedTurns: clearedReplyTurns(events, folded.nodes, new Set(hidden.map((entry) => entry.seq))),
@@ -263,6 +390,54 @@ async function stateOf(ctx, sessionId) {
   };
 }
 
+/**
+ * 用户在一轮还在生成时点了删除：**停这一轮是这次点击的一部分**。
+ *
+ * 只停回合，不动压缩（压缩没有"停止"语义，维持原来的 busy 拒绝）。
+ * cancel 受理之后轮询日志直到 `turn/end` 落地；超时回 `stop-timeout`，不硬删。
+ *
+ * @param sessionId - 会话 id（两种写法都会试，与文件里其它查找一致）。
+ * @param events - 当前日志（用来判断是"回合未闭合"还是"正在压缩"）。
+ */
+async function stopActiveTurn(ctx, sessionId, events) {
+  if (openTurn(events) === null) {
+    throw new HttpError(409, 'busy', 'the session is compacting; wait for it to finish');
+  }
+  let controller = null;
+  try {
+    controller = ctx.get('sessionController');
+  } catch {
+    controller = null;
+  }
+  if (!controller || typeof controller.cancel !== 'function') {
+    throw new HttpError(409, 'busy', 'the running turn cannot be stopped here');
+  }
+  let acknowledged = false;
+  let lastError = null;
+  for (const variant of idVariants(sessionId)) {
+    try {
+      await controller.cancel({ sessionId: variant });
+      acknowledged = true;
+      break;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  if (!acknowledged) {
+    throw new HttpError(409, 'busy', `the stop request was refused: ${String((lastError && lastError.message) || lastError)}`);
+  }
+  logLine('info', '生成中删除：已请求停止当前回合', { sessionId });
+  const deadline = Date.now() + stopWait.timeoutMs;
+  for (;;) {
+    await new Promise((resolve) => setTimeout(resolve, stopWait.pollMs));
+    const current = await readEvents(ctx, sessionId);
+    if (current && !isBusy(current)) return;
+    if (Date.now() >= deadline) {
+      throw new HttpError(409, 'stop-timeout', `the running turn did not stop within ${Math.round(stopWait.timeoutMs / 1000)}s`);
+    }
+  }
+}
+
 async function deleteTarget(ctx, sessionId, body) {
   const mode = typeof body.mode === 'string' ? body.mode : '';
   if (!MODES.has(mode)) throw new HttpError(400, 'invalid', 'mode must be message, step or reply');
@@ -270,9 +445,15 @@ async function deleteTarget(ctx, sessionId, body) {
   if (!session || typeof session.append !== 'function') {
     throw new HttpError(409, 'session-not-active', 'the session is not open in DSH');
   }
-  const events = await readEvents(ctx, sessionId);
+  let events = await readEvents(ctx, sessionId);
   if (!events) throw new HttpError(404, 'session-not-found', 'no session log for this id');
-  if (isBusy(events)) throw new HttpError(409, 'busy', 'the session is still working');
+  if (isBusy(events)) {
+    // 先停、再删；停止之后**重新读日志**，窗口必须建立在收尾后的 surface 上。
+    await stopActiveTurn(ctx, sessionId, events);
+    events = await readEvents(ctx, sessionId);
+    if (!events) throw new HttpError(404, 'session-not-found', 'no session log for this id');
+    if (isBusy(events)) throw new HttpError(409, 'busy', 'the session is still working');
+  }
 
   const surfaceNodes = surfaceOf(ctx, sessionId, events);
   let plan;
@@ -525,7 +706,15 @@ export function apply(ctx) {
     },
   }));
 
-  logLine('info', '消息删除半边已注册（/wm-delete/state、/wm-delete/delete）', null);
+  // 降噪：「已注册」内容每次 apply 都一样，只在**本进程第一次**写。
+  // 以前每次 apply 都写一条，一天几十次重载就把日志刷成了流水账（实测 3 000+ 行里
+  // 绝大多数是这条）。版本随记录一起写，方便对齐"这条是哪一版留下的"。
+  logLine(
+    'info',
+    '消息删除半边已注册（/wm-delete/state、/wm-delete/delete）',
+    { version: PLUGIN_VERSION },
+    { onceKey: `registered:${PLUGIN_VERSION}` },
+  );
 
   return () => {
     for (const dispose of disposers) {
@@ -535,6 +724,7 @@ export function apply(ctx) {
         /* ignore */
       }
     }
+    // 卸载不算噪声：它与注册成对出现，是排查"HMR 是否真的重载过"的关键证据。
     logLine('info', '消息删除半边已卸载', null);
   };
 }

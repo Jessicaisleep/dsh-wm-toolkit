@@ -24,10 +24,18 @@ const suites = [
   { label: 'manager · 桥接会话 id 转义（删不掉/删了又回来）', file: join(here, '..', 'parts', 'manager', 'tests', 'wm-escaped-session-id.test.mjs') },
   { label: 'manager · v4 会话工件（有内容却说没有磁盘记录 + 禁阻塞弹窗）', file: join(here, '..', 'parts', 'manager', 'tests', 'wm-v4-artifact.test.mjs') },
   { label: 'manager · 宿主冒烟', file: join(here, '..', 'parts', 'manager', 'tests', 'smoke-host.cjs') },
+  { label: 'manager · API 鉴权门（fail-closed / owner-only / 结构栅栏）', file: join(here, '..', 'parts', 'manager', 'tests', 'wm-manager-api-auth.test.mjs') },
   { label: 'delete · 删除逻辑核心', file: join(here, '..', 'parts', 'delete', 'tests', 'wm-delete-logic.test.mjs') },
+  { label: 'delete · 头窗口守卫（窗口不得覆盖 surface 节点 0）', file: join(here, '..', 'parts', 'delete', 'tests', 'wm-delete-head-window.test.mjs') },
+  { label: 'delete · 先停后删（生成中删除走 sessionController.cancel）', file: join(here, '..', 'parts', 'delete', 'tests', 'wm-delete-stop-first.test.mjs') },
   { label: 'delete · 宿主集成（含官方 surface 契约验收）', file: join(here, '..', 'parts', 'delete', 'tests', 'wm-delete-host.test.mjs') },
   { label: 'delete · 浏览器半边冒烟', file: join(here, '..', 'parts', 'delete', 'tests', 'wm-delete-client.smoke.mjs') },
   { label: 'delete · 按钮位置回归（迷你 DOM）', file: join(here, '..', 'parts', 'delete', 'tests', 'wm-delete-placement.test.mjs') },
+  { label: 'delete · 隐藏归因（不显示别人藏着的行）', file: join(here, '..', 'parts', 'delete', 'tests', 'wm-delete-foreign-hide.test.mjs') },
+  { label: 'delete · 重新 apply 不叠幽灵按钮', file: join(here, '..', 'parts', 'delete', 'tests', 'wm-delete-reapply.test.mjs') },
+  { label: 'delete · 删除线预览（确认框先划出待删段落，不锁滚动）', file: join(here, '..', 'parts', 'delete', 'tests', 'wm-delete-pending-preview.test.mjs') },
+  { label: 'delete · 防重入 + 停止预算（60s / 超时文案可操作）', file: join(here, '..', 'parts', 'delete', 'tests', 'wm-delete-reentry.test.mjs') },
+  { label: 'delete · 日志卫生（测试不污染生产日志 / 降噪 / 轮转）', file: join(here, '..', 'parts', 'delete', 'tests', 'wm-delete-log-hygiene.test.mjs') },
 ];
 
 let failed = 0;

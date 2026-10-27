@@ -72,6 +72,7 @@ window.__ModuleLoader__.load({
       'error.unsupported-session': '无法识别这个会话的标识，删除没有下发。请刷新页面后重试；若一直如此，请把这条提示反馈给插件作者。',
       'error.session-not-found': '找不到该会话的日志。',
       'error.busy': '该会话正在进行中，请等回复结束后再删除。',
+      'error.stop-timeout': '已请求停止这一轮，但它在等待上限内还没停完。可以再点一次删除，或先点界面上的停止键手动停下，然后再删。',
       'error.already-deleted': '这条内容已经从上下文中删除了。',
       'error.not-deletable': '这个位置不支持删除。',
       'error.range-not-clean': '目标区间包含其它内容，已取消删除。',
@@ -102,6 +103,7 @@ window.__ModuleLoader__.load({
       'error.unsupported-session': 'This session id is not usable, so nothing was sent. Refresh the page and try again.',
       'error.session-not-found': 'No session log was found for this id.',
       'error.busy': 'This session is still working; wait for the reply to finish.',
+      'error.stop-timeout': 'The turn was asked to stop but has not finished closing yet. Try deleting again, or press the stop button first and then delete.',
       'error.already-deleted': 'This content is already removed from the context.',
       'error.not-deletable': 'This position cannot be deleted.',
       'error.range-not-clean': 'The target window contains unrelated content; the delete was cancelled.',
@@ -133,12 +135,25 @@ window.__ModuleLoader__.load({
       '.dshwd-collapsing{overflow:hidden;transition:height .2s ease,opacity .14s ease,margin .2s ease,padding .2s ease}',
       '[data-dshwd-hidden="1"]{display:none!important}',
       '[data-dshwd-no-target="1"] .dshwd-action{display:none!important}',
+      // 确认框开着时的"将被删除"预览：只加删除线 + 淡红底，**不锁滚动、不遮内容**，
+      // 所以用户还能上下翻看自己到底要删哪几段；点取消标记随即消失。
+      '[data-dshwd-pending="1"]{text-decoration:line-through!important;text-decoration-thickness:1.5px;text-decoration-color:var(--dsw-alias-state-error-primary,#d54941);background:color-mix(in srgb,var(--dsw-alias-state-error-primary,#d54941) 8%,transparent);border-radius:6px;transition:background-color .12s,text-decoration-color .12s}',
+      '[data-dshwd-pending="1"] *{text-decoration:line-through!important;text-decoration-color:var(--dsw-alias-state-error-primary,#d54941)}',
       '.dshwd-dialog-text{margin:0;color:var(--dsw-alias-label-primary,inherit);font-size:14px;line-height:22px}',
       '.dshwd-dialog-note{margin:10px 0 0;color:var(--dsw-alias-label-tertiary,#8a8f98);font-size:13px;line-height:20px}',
       '.dshwd-dialog-option{margin:12px 0 0;display:flex;align-items:flex-start;gap:8px;color:var(--dsw-alias-label-primary,inherit);font-size:13px;line-height:20px;cursor:pointer}',
       '.dshwd-dialog-checkbox{margin:3px 0 0;flex:none;accent-color:var(--dsw-alias-state-error-primary,#d54941)}',
       '.dshwd-dialog-error{margin:10px 0 0;color:var(--dsw-alias-state-error-primary,#d54941);font-size:13px;line-height:20px}',
-      '.dshwd-danger{background:var(--dsw-alias-state-error-primary,#d54941)!important;color:var(--dsw-alias-label-primary-foreground,#fff)!important}',
+      // 确认条：**非模态**浮层，贴在输入框上方，不遮正文、不锁滚动。
+      // 用户要能一边翻看被划删除线的段落、一边决定删不删 —— 这是这个功能存在的理由。
+      '.dshwd-confirm{position:fixed;left:50%;bottom:96px;transform:translateX(-50%);z-index:40;width:min(560px,calc(100vw - 48px));pointer-events:none}',
+      '.dshwd-confirmBox{pointer-events:auto;background:var(--dsw-alias-bg-layer-3,#1f2023);border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.28));border-radius:14px;padding:14px 16px;box-shadow:0 10px 30px rgba(0,0,0,.28);backdrop-filter:blur(6px)}',
+      '.dshwd-confirmTitle{margin:0 0 6px;font-size:15px;line-height:22px;font-weight:600;color:var(--dsw-alias-label-primary,inherit)}',
+      '.dshwd-confirmActions{margin-top:12px;display:flex;justify-content:flex-end;gap:8px}',
+      '.dshwd-confirmBtn{height:30px;padding:0 14px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.28));background:transparent;color:var(--dsw-alias-label-primary,inherit);font-size:13px;cursor:pointer}',
+      '.dshwd-confirmBtn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.12))}',
+      '.dshwd-confirmBtn:disabled{opacity:.5;cursor:not-allowed}',
+      '.dshwd-danger{background:var(--dsw-alias-state-error-primary,#d54941)!important;color:var(--dsw-alias-label-primary-foreground,#fff)!important;border-color:transparent!important}',
       '@media (prefers-reduced-motion:reduce){.dshwd-collapsing{transition:none}.dshwd-floating{transition:none}}',
     ].join('');
 
@@ -189,6 +204,8 @@ window.__ModuleLoader__.load({
         this.sessionId = sessionId;
         this.listeners = new Set();
         this.inflight = null;
+        /** 删除请求是否在途（防重入锁；与上面的 /state 去重 `inflight` 不是一回事）。 */
+        this.confirmInFlight = false;
         this.animateOnce = false;
         /** surface 抓取之后的防抖刷新计时器（见 scheduleRefresh）。 */
         this.refreshTimer = null;
@@ -202,10 +219,18 @@ window.__ModuleLoader__.load({
           // 每一段回复的段尾 seq（宿主给出）。只有段尾那一行长「删除这段回复」按钮，
           // 于是"回合中途插话之前的那些段"也有自己的入口，而不是只有回合结尾才有。
           segmentTails: new Set(),
+          // 每一段回复遮蔽的 surface seq 窗口：确认框打开时据此给"将被删除的行"加删除线。
+          segmentWindows: [],
+          // surface seq → messageId：官方槽只用 messageId，靠它换算出"落在哪一段"。
+          messageIdsBySeq: new Map(),
           // 每个可删回合被切成几段回复：>1 时确认框才提供「同时删掉这一轮其它回复段」。
           segmentsByTurn: {},
           // 确认框里的「整轮删除」勾选状态（默认关闭＝只删被点的那一段）。
           wholeTurn: false,
+          // 防重入：请求已发出但还没回来时为 true（与 `pending` 的界面态分开记，
+          // 因为 `pending` 要等到 publish 之后才生效，中间那一瞬足够连点两次）。
+          // 它**写进 view** 而不是做成 getSnapshot 的派生字段：别返回新对象（见 getSnapshot）。
+          confirmInFlight: false,
           // 上次抓 surface 时的日志末尾 seq。用来识别"抓完之后又产生了新内容"——
           // 那些内容的 seq 不在 surface 里，但绝不能因此被判成不可删（否则刚发出的消息、
           // 刚完成的回复都没有删除入口，要重启 DSH 才出现）。
@@ -220,6 +245,17 @@ window.__ModuleLoader__.load({
         });
       }
 
+      /**
+       * 对外快照。
+       *
+       * ⚠️ 必须返回**同一个引用**直到状态真的变化。React 的 `useSyncExternalStore`
+       * 会反复求值 `getSnapshot()` 并用 `Object.is` 比较；每次返回新对象会被判成
+       * "状态一直在变"，重渲染到 React 抛错（"The result of getSnapshot should be
+       * cached"），于是整个槽渲染崩溃 —— **连官方助手操作条上的删除按钮一起消失**
+       * （2026-10-28 真机踩到：重启后所有删除按钮都不见了）。
+       *
+       * `confirmInFlight` 因此写进 view、随 publish 一起发布，而不是在这里临时拼对象。
+       */
       getSnapshot = () => this.view;
 
       subscribe = (listener) => {
@@ -276,6 +312,26 @@ window.__ModuleLoader__.load({
             for (const seq of Array.isArray(data.segmentTails) ? data.segmentTails : []) {
               if (typeof seq === 'number') segmentTails.add(seq);
             }
+            // 每段遮蔽的 surface seq：确认框预览删除线要用（见 pendingSeqsFor）。
+            const segmentWindows = [];
+            for (const window of Array.isArray(data.segmentWindows) ? data.segmentWindows : []) {
+              if (window === null || typeof window !== 'object') continue;
+              if (typeof window.turn !== 'number' || !Array.isArray(window.shadowed)) continue;
+              segmentWindows.push({
+                turn: window.turn,
+                startSeq: window.startSeq,
+                endSeq: window.endSeq,
+                shadowed: window.shadowed.filter((seq) => typeof seq === 'number'),
+              });
+            }
+            // surface seq → messageId：官方槽只用 messageId，得靠它换算出"落在哪一段"。
+            const messageIdsBySeq = new Map();
+            if (data.messageIdsBySeq !== null && typeof data.messageIdsBySeq === 'object') {
+              for (const [seq, id] of Object.entries(data.messageIdsBySeq)) {
+                const numeric = Number(seq);
+                if (Number.isFinite(numeric) && typeof id === 'string' && id !== '') messageIdsBySeq.set(numeric, id);
+              }
+            }
             const segmentsByTurn = {};
             if (data.segmentsByTurn !== null && typeof data.segmentsByTurn === 'object') {
               for (const [turn, count] of Object.entries(data.segmentsByTurn)) {
@@ -288,6 +344,8 @@ window.__ModuleLoader__.load({
               replyTurns,
               clearedTurns,
               segmentTails,
+              segmentWindows,
+              messageIdsBySeq,
               segmentsByTurn,
               lastSeq: typeof data.lastSeq === 'number' ? data.lastSeq : -1,
               surfaceReady: true,
@@ -339,6 +397,13 @@ window.__ModuleLoader__.load({
 
       async confirm() {
         const target = this.view.dialog;
+        // 防重入：两个门槛都要看。
+        //   - `this.confirmInFlight` 是同步的实例字段，在第一个 await 之前就置位，
+        //     所以"同一帧里连点两次"也只会发出一个请求；
+        //   - `view.pending` 是界面态，用来挡"已经发出去、正在等结果"的重复点击。
+        // 只靠 `view.pending` 是不够的：它是 publish 之后才生效的，中间那一瞬足够第二次调用进来。
+        // （与 `this.inflight` 区分：那是 /state 请求的去重，和删除无关。）
+        if (this.confirmInFlight === true) return;
         if (target === null || this.view.pending) return;
         if (!usableSessionId(this.sessionId)) {
           // 本地拦截时宿主一条日志都不会有（请求根本没发），所以这里必须吭一声：
@@ -351,7 +416,8 @@ window.__ModuleLoader__.load({
           this.publish({ pending: false, failure: 'unsupported-session' });
           return;
         }
-        this.publish({ pending: true, failure: null });
+        this.confirmInFlight = true;
+        this.publish({ pending: true, failure: null, confirmInFlight: true });
         // scope 只在勾了「整轮」时下发；不勾就等于 segment（宿主默认也只认 segment）。
         const request = this.view.wholeTurn === true && target.mode === 'reply'
           ? { ...target, scope: 'turn' }
@@ -382,6 +448,10 @@ window.__ModuleLoader__.load({
           if (!Array.isArray(data.clearedTurns)) this.scheduleRefresh();
         } catch {
           this.publish({ pending: false, failure: 'generic' });
+        } finally {
+          // 无论成功、被拒还是抛错，都要放开重入锁，否则按钮会永久失效。
+          this.confirmInFlight = false;
+          this.publish({ confirmInFlight: false });
         }
       }
 
@@ -403,6 +473,57 @@ window.__ModuleLoader__.load({
      *   - 行上的垃圾桶永远是 **scope: 'segment'** —— 只删你点的这一段回复（所见即所得）；
      *   - **scope: 'turn'** 只在确认框里勾选「同时删掉这一轮其它回复段」时加上。
      */
+    /**
+     * 这一行是不是"本回合的最后一段"的段尾。只有最后一段才把按钮让给官方槽。
+     *
+     * 官方助手操作条只渲染在回合末尾那一行，覆盖不到中间段；所以中间段必须由行内入口顶上
+     * （真机表现：若把所有带 messageId 的行都让出，就只剩最底部一个按钮）。
+     *
+     * @param turn - 该行所属回合号。
+     * @param seq - 该行的段尾 seq（宿主报出的 tailSeq）。
+     * @param view - 当前快照（要用 `segmentWindows`）。
+     * @returns true 表示"最后一段，交给官方槽"。
+     */
+    function isLastSegmentOfTurn(turn, seq, view) {
+      if (typeof turn !== 'number' || view === undefined) return false;
+      const windows = Array.isArray(view.segmentWindows) ? view.segmentWindows : [];
+      let owner = null;
+      let maxEnd = -Infinity;
+      for (const window of windows) {
+        if (window === null || typeof window !== 'object' || window.turn !== turn) continue;
+        if (typeof window.endSeq === 'number' && window.endSeq > maxEnd) maxEnd = window.endSeq;
+        if (Array.isArray(window.shadowed) && window.shadowed.includes(seq)) owner = window;
+      }
+      if (owner === null) return false;
+      // 这一行所在的段，就是该回合 endSeq 最大的那一段 → 它是最后一段。
+      return typeof owner.endSeq === 'number' && owner.endSeq === maxEnd;
+    }
+
+    /**
+     * 该回合**最后一段**的段尾 seq（用于"顶部披露行没有锚点"时的兜底入口）。
+     *
+     * 必须取"最后一段"，不能拿整轮号当目标——后者会把"删这一段"扩成"删整轮"。
+     *
+     * @returns seq，或 undefined（拿不到段信息）。
+     */
+    function lastSegmentTailOfTurn(turn, view) {
+      if (typeof turn !== 'number' || view === undefined) return undefined;
+      const windows = Array.isArray(view.segmentWindows) ? view.segmentWindows : [];
+      let best = null;
+      for (const window of windows) {
+        if (window === null || typeof window !== 'object' || window.turn !== turn) continue;
+        if (best === null || (typeof window.endSeq === 'number' && window.endSeq > best.endSeq)) best = window;
+      }
+      if (best === null || !Array.isArray(best.shadowed) || best.shadowed.length === 0) return undefined;
+      // 优先用宿主报出的段尾行（有可见文本的 assistant），否则回落到该段最后一个节点。
+      const tails = view.segmentTails instanceof Set ? view.segmentTails : new Set();
+      for (let index = best.shadowed.length - 1; index >= 0; index -= 1) {
+        const seq = best.shadowed[index];
+        if (tails.has(seq)) return seq;
+      }
+      return best.shadowed[best.shadowed.length - 1];
+    }
+
     function targetFor(node, view) {
       const data = node.data || {};
       const turn = typeof data.turn === 'number' ? data.turn : undefined;
@@ -420,10 +541,18 @@ window.__ModuleLoader__.load({
           return seq === undefined ? null : { mode: 'step', seq, label: 'step' };
         }
         case 'turn-process': {
-          // 过程折叠条锚在**这一轮的答案**上（最后一段的段尾），点它删最后那一段。
+          // 「已思考 / 已完成分析 / 用时 N 秒」这类回合披露行**要有**删除入口。
+          //
+          // 曾经照抄上游 dsh-delete-turn 把它去掉（理由是"与段尾重复"），但那是错的：
+          // 我们自己的结论是**每段对应一个删除按钮**——同一段有"顶部披露行"与"底部操作条"
+          // 两个入口是设计，不是重复（用户在这里就是找不到顶部那个按钮）。
+          //
+          // 关键是**精确指向这一段**，而不是整轮：披露行锚在该段答案上（`answerAnchorSeq`）；
+          // 拿不到锚点时退回该回合的**最后一段**段尾，绝不退回 `turn`（那会变成整轮）。
           const anchor = typeof data.answerAnchorSeq === 'number' ? data.answerAnchorSeq : undefined;
           if (anchor !== undefined) return withTurn({ mode: 'reply', seq: anchor, label: 'reply' });
-          return turn === undefined ? null : { mode: 'reply', turn, label: 'reply' };
+          const tail = lastSegmentTailOfTurn(turn, view);
+          return tail === undefined ? null : withTurn({ mode: 'reply', seq: tail, label: 'reply' });
         }
         case 'turn-error':
         case 'model-retry':
@@ -438,12 +567,19 @@ window.__ModuleLoader__.load({
           const final = data.finalNode;
           const seq = final && typeof final.seq === 'number' ? final.seq : undefined;
           if (seq === undefined) return null;
-          // 每一条回复都要有自己的「删除这段回复」入口：回合中途插话之前的那些段没有回合尾行，
-          // 官方助手操作条也只长在回合尾行上，所以只删一段的入口必须挂在这一行自己身上。
-          // 只挂**段尾**那一行（宿主用 segmentTails 报出段尾 seq）——每段恰好一个入口，
+          // surface 还没抓回来时（segmentTails 为空）保持旧行为、乐观放行：
+          // 否则用户会看到"又没有删除按钮了"。这条判据必须**排在后面所有判据之前**，
+          // 因为还没抓 surface 时我们无法确认官方槽是否真的渲染了入口。
+          if (view === undefined || view.segmentTails.size === 0) return withTurn({ mode: 'reply', seq, label: 'reply' });
+          // 只挂**段尾**那一行（宿主用 segmentTails 报出段尾 seq）：每段恰好一个入口，
           // 段中间的步骤行不重复长按钮（那些行的精细删除走思考卡 / 工具卡的「删这一步」）。
-          // surface 还没抓回来时（segmentTails 为空）保持旧行为，由官方槽提供入口。
-          if (view !== undefined && view.segmentTails.size > 0 && !view.segmentTails.has(seq)) return null;
+          // 段尾优先取"最后一个有可见文本的 assistant"，避免挂到工具卡 / 折叠壳上（见 tailSeq）。
+          if (!view.segmentTails.has(seq)) return null;
+          // 官方助手操作条只在**回合末尾那一行**渲染，覆盖不到中间段。所以让出按钮的判据
+          // 必须是"这一行就是本回合的最后一段"，**不能**是"这行带 messageId" ——
+          // 后者会让多段回合的中间段全部失去入口（真机表现：只有最底部的删除按钮回来了，
+          // 头部的都不见了）。
+          if (final.messageId !== undefined && isLastSegmentOfTurn(turn, seq, view)) return null;
           return withTurn({ mode: 'reply', seq, label: 'reply' });
         }
         default:
@@ -540,6 +676,39 @@ window.__ModuleLoader__.load({
     const rowActions = new WeakMap();
     const thinkActions = new WeakMap();
 
+    /**
+     * 哪些归属属性表示"这一行正被别人按契约藏着"。
+     *
+     * 这几对名字来自同族插件的隐藏契约（`<prefix>` + `data-<prefix>-hidden`）：
+     * dsh-edit-turn 用 `dshet`、dsh-rerun-turn 用 `dsrr`、上游 dsh-delete-turn 用 `dshdt`。
+     * 本插件自己的前缀是 `dshwd`。新增兄弟插件时往这里加一行即可。
+     */
+    const HIDE_OWNERS = [
+      ['dshwd', 'data-dshwd-hidden', 'dshwdHidden'],
+      ['dshdt', 'data-dshdt-hidden', 'dshdtHidden'],
+      ['dshet', 'data-dshet-hidden', 'dshetHidden'],
+      ['dsrr', 'data-dsrr-hidden', 'dsrrHidden'],
+    ];
+
+    /**
+     * 除 `own` 之外，还有没有别的插件声明这一行隐藏。
+     *
+     * 判据用**属性**（`data-*-hidden`）而不只是 `dataset`：迷你 DOM 与真实 DOM 都能读，
+     * 而且属性是跨插件唯一稳定的约定（类名和样式都可能被谁改掉）。
+     *
+     * @param row - 一行元素。
+     * @param own - 本插件的前缀（`dshwd`），跳过它自己那份。
+     * @returns 有别人的归属就算 true。
+     */
+    function foreignHideOn(row, own) {
+      for (const [key, attr, prop] of HIDE_OWNERS) {
+        if (key === own) continue;
+        if (row.dataset && row.dataset[prop] === '1') return true;
+        if (typeof row.hasAttribute === 'function' && row.hasAttribute(attr)) return true;
+      }
+      return false;
+    }
+
     function setRowHidden(row, hide, animate) {
       if (hide) {
         if (row.dataset.dshwdHidden === '1') return;
@@ -570,7 +739,10 @@ window.__ModuleLoader__.load({
       if (row.dataset.dshwdHidden !== '1') return;
       delete row.dataset.dshwdHidden;
       row.classList.remove('dshwd-collapsing');
-      row.style.display = '';
+      // 别的插件可能**仍然**按它自己的归属属性把这行藏着：交还自己那份折叠样式，
+      // 但要把 display:none 留着，等它自己解除。无条件清成 '' 会把别人的隐藏一并抹掉，
+      // 表现为"被 dsh-message-edit / dsh-rerun-turn 藏起来的行突然复活"。
+      row.style.display = foreignHideOn(row, 'dshwd') ? 'none' : '';
       row.style.height = '';
       row.style.opacity = '';
       row.style.marginTop = '';
@@ -614,18 +786,77 @@ window.__ModuleLoader__.load({
       return null;
     }
 
+    /** 注入宿主的命名空间标记：只认自己的节点，绝不动宿主与兄弟插件的按钮。 */
+    const HOST_MARK = 'data-dshwd-action-host';
+    const THINK_MARK = 'data-dshwd-think-action';
+    const HOST_CLASS = 'dshwd-action-host';
+
+    function isThinkHost(host) {
+      return host.getAttribute(THINK_MARK) === '1' || host.classList.contains('dshwd-think-action');
+    }
+
+    /**
+     * 在这一行里找**本插件上一次 apply 留下的**宿主节点。
+     *
+     * 先按命名空间属性找，再按类名兜底（升级前的老版本只打了类名，没有属性）——
+     * 两种情况都要认领，否则就会在旁边再叠一个幽灵按钮。只有带本插件属性 / 类名的节点
+     * 才可能命中，宿主与兄弟插件的节点不在选择器范围内。
+     *
+     * @param scope - 行或思考卡容器。
+     * @param wantThink - true 找思考卡宿主，false 找行宿主。
+     * @returns 已有宿主，或 null。
+     */
+    function findOwnedActionHost(scope, wantThink) {
+      const marked = scope.querySelectorAll(`[${HOST_MARK}="1"]`);
+      for (const host of marked) if (isThinkHost(host) === wantThink) return host;
+      const legacy = scope.querySelectorAll(`.${HOST_CLASS}`);
+      for (const host of legacy) if (isThinkHost(host) === wantThink) return host;
+      return null;
+    }
+
+    /**
+     * 复用 `host`（补上命名空间、补回它可能丢掉的按钮），或新建一个。
+     * 认领而不是 remove + re-insert：同一个节点留在原位，宿主的渲染不会被扰动。
+     */
+    function adoptActionHost(host, kind) {
+      const node = host === null || host === undefined ? document.createElement('span') : host;
+      node.className = kind === 'think' ? `${HOST_CLASS} dshwd-think-action` : HOST_CLASS;
+      node.setAttribute(HOST_MARK, '1');
+      if (kind === 'think') node.setAttribute(THINK_MARK, '1');
+      else node.removeAttribute(THINK_MARK);
+      let button = node.querySelector('button');
+      if (button === null) {
+        button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'dshwd-action dshwd-row-action';
+        button.innerHTML = ICON_MARKUP;
+        node.appendChild(button);
+      }
+      return node;
+    }
+
+    /** 按命名空间扫掉本插件注入的全部宿主（卸载时用，不碰任何别人的节点）。 */
+    function sweepOwnHosts() {
+      for (const selector of [`[${HOST_MARK}="1"]`, `.${HOST_CLASS}`]) {
+        for (const host of document.querySelectorAll(selector)) {
+          try {
+            host.remove();
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    }
+
     function injectRowAction(row, node, target, controller, t) {
       const label = t(`action.tooltip.${target.label}`);
       let entry = rowActions.get(row);
       if (!entry) {
-        const host = document.createElement('span');
-        host.className = 'dshwd-action-host';
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.className = 'dshwd-action dshwd-row-action';
-        button.innerHTML = ICON_MARKUP;
-        host.appendChild(button);
-        entry = { host, button };
+        // 上一次 apply 留下的宿主（HMR / 插件开关 / bundle 组重载）**直接认领**，
+        // 不要再建第二个：每次 apply 都是新的模块实例、新的 WeakMap，而旧宿主还挂在行里，
+        // 于是同一条行上会叠出多个删除按钮（真机 CDP 曾在同一行数到 3 个）。
+        const host = adoptActionHost(findOwnedActionHost(row, false), 'row');
+        entry = { host, button: host.querySelector('button') };
         rowActions.set(row, entry);
       }
       const { host, button } = entry;
@@ -667,14 +898,9 @@ window.__ModuleLoader__.load({
       const label = t('action.tooltip.step');
       let entry = thinkActions.get(think);
       if (!entry) {
-        const host = document.createElement('span');
-        host.className = 'dshwd-action-host dshwd-think-action';
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.className = 'dshwd-action dshwd-row-action';
-        button.innerHTML = ICON_MARKUP;
-        host.appendChild(button);
-        entry = { host, button };
+        // 同行宿主：先认领上一次 apply 留下的思考卡宿主（见 findOwnedActionHost）。
+        const host = adoptActionHost(findOwnedActionHost(think, true), 'think');
+        entry = { host, button: host.querySelector('button') };
         thinkActions.set(think, entry);
       }
       const { host, button } = entry;
@@ -722,9 +948,97 @@ window.__ModuleLoader__.load({
       return Boolean(closing && closing.finalNode && closing.finalNode.messageId !== undefined);
     }
 
+    /** 正在等待确认的删除窗口（确认框开着时非空）；`applyDom` 用它决定给哪些行划线。 */
+    let pendingWindowSeqs = null;
+
+    /**
+     * 当前确认框的目标会删掉哪些 surface seq。
+     *
+     * - `message` / `step` / `reply`（seq 或 turn）：直接用宿主报出的 surface 台账；
+     * - `reply` + `scope:'turn'`（勾了"整轮"）：该回合全部段；
+     * - 还没拿到台账（surface 未就绪）：返回 null，表示"不划线"而不是"划错线"。
+     *
+     * @returns Set<number> 或 null。
+     */
+    function pendingSeqsFor(view) {
+      const target = view.dialog;
+      if (target === null || target === undefined) return null;
+      if (!view.surfaceReady) return null;
+      const out = new Set();
+      const mode = typeof target.mode === 'string' ? target.mode : '';
+      // 单点定位：被点的那个 seq 本身。
+      if (typeof target.seq === 'number') out.add(target.seq);
+      // 整轮：该回合的全部段窗口。
+      if (mode === 'reply' && target.scope === 'turn' && typeof target.turn === 'number') {
+        for (const window of view.segmentWindows) {
+          if (window.turn !== target.turn) continue;
+          for (const seq of window.shadowed) out.add(seq);
+        }
+        return out.size > 0 ? out : null;
+      }
+      // 只删一段：找出包含被点 seq（或该回合唯一段）的那一段。
+      if (mode === 'reply') {
+        for (const window of view.segmentWindows) {
+          if (typeof target.turn === 'number' && window.turn !== target.turn) continue;
+          // 官方槽（底部/头部按钮）只带 messageId，**不带 seq**：此时判据是
+          // "这一段的任一段尾 seq 上是否挂着这个 messageId"。
+          // 少了这条分支，官方槽点开的确认框就永远划不到线（真机表现：底部按钮删得掉、
+          // 但没有删除线；用户指令走 seq，所以正常）。
+          const hit =
+            typeof target.seq === 'number'
+              ? window.shadowed.includes(target.seq)
+              : typeof target.messageId === 'string'
+                ? window.shadowed.some((seq) => view.messageIdsBySeq.get(seq) === target.messageId)
+                : typeof target.turn === 'number';
+          if (!hit) continue;
+          for (const seq of window.shadowed) out.add(seq);
+          break;
+        }
+      }
+      return out.size > 0 ? out : null;
+    }
+
+    /**
+     * 给一行打 / 撤「将被删除」的标记。
+     *
+     * 只加 `data-dshwd-pending="1"`，视觉全交给样式表（`text-decoration: line-through`）。
+     * 不藏行、不动 `overflow`、不动 `pointer-events`：长段落必须还能滚动查看，
+     * 否则用户没法确认自己要删的范围（DSH 的 Modal 自己会锁滚动，不能再叠加一层）。
+     */
+    function markPendingRow(row, seqs, view, hidden) {
+      if (hidden) {
+        if (row.dataset.dshwdPending !== undefined) delete row.dataset.dshwdPending;
+        return;
+      }
+      if (pendingWindowSeqs === null) {
+        if (row.dataset.dshwdPending !== undefined) delete row.dataset.dshwdPending;
+        return;
+      }
+      const hit = seqs.some((seq) => pendingWindowSeqs.has(seq));
+      if (hit && row.dataset.dshwdPending !== '1') row.dataset.dshwdPending = '1';
+      else if (!hit && row.dataset.dshwdPending !== undefined) delete row.dataset.dshwdPending;
+    }
+
+    /**
+     * 撤掉所有"过期"的划线标记。
+     *
+     * 确认框关闭、目标变化、或行已经不在这次窗口里时调用。按命名空间属性全局扫，
+     * 只清本插件自己的标记（不碰宿主与兄弟插件的节点）。
+     */
+    function sweepStalePendingMarks() {
+      for (const row of document.querySelectorAll('[data-dshwd-pending="1"]')) {
+        if (pendingWindowSeqs === null) {
+          delete row.dataset.dshwdPending;
+          continue;
+        }
+      }
+    }
+
     function applyDom(snapshot, view, controller, t) {
       if (!snapshot || !snapshot.nodes || typeof snapshot.nodes.get !== 'function') return;
       const animate = controller.consumeAnimate();
+      // 先算清楚"这次确认会删哪些行"：确认框关着就是 null（不划线）。
+      pendingWindowSeqs = pendingSeqsFor(view);
       const rows = document.querySelectorAll('[data-chat-flow-key]');
       // 这一帧里有没有"surface 抓取之后才出现"的内容。有就安排一次防抖刷新，
       // 让下一帧的判定建立在最新 surface 上（按钮本身已由乐观放行显示出来）。
@@ -758,7 +1072,15 @@ window.__ModuleLoader__.load({
         else removeRowAction(row);
         if (!hidden && covered && !rowDeletable(node, seqs, view)) row.dataset.dshwdNoTarget = '1';
         else delete row.dataset.dshwdNoTarget;
+        // 任务：确认框开着的时候，给**将被删除的行**加删除线。
+        // 用户点删除后先看到"哪几行会被划掉"，确认无误再落刀；取消则标记随之消失。
+        // 只做只读标注（不藏行、不锁滚动 —— DSH 的 Modal 会锁窗口，长段落没法翻看，
+        // 所以这里绝不动 overflow / pointer-events，让用户能滚着核对）。
+        markPendingRow(row, seqs, view, hidden);
       }
+      // 确认框消失（或目标变了）时，把上一轮打的标记全部撤掉：只扫本插件自己的属性，
+      // 不碰任何别人的节点（与 sweepOwnHosts 同一个命名空间约定）。
+      sweepStalePendingMarks();
       for (const row of syntheticRows) {
         setRowHidden(row, isClearedRow(row, undefined, view) || groupFullyHidden(row), animate);
       }
@@ -796,8 +1118,19 @@ window.__ModuleLoader__.load({
       });
     }
 
+    /**
+     * 删除确认条。
+     *
+     * **刻意不用 `primitives.Modal`**：那是个模态对话框，会把整个 DSH 窗口锁住（滚动也被锁），
+     * 于是删除线预览划出很长一段时，用户根本翻不到下面去看自己到底要删什么——而这个功能
+     * 的全部意义就是"落刀之前看清楚"。
+     *
+     * 换成**非模态**的底部浮层：不接管焦点、不锁滚动、不遮住正文，用户可以一边上下翻看
+     * 划了删除线的段落，一边决定"取消"还是"删除"。确认/取消按钮固定在浮层里。
+     */
     function ConfirmDialog({ view, controller, t }) {
       const target = view.dialog;
+      if (target === null || target === undefined) return null;
       const mode = target && typeof target.mode === 'string' ? target.mode : 'message';
       const failure = view.failure;
       // 只有 reply 才可能有多段：这一轮被真人提问切成了几段（>1 才提供整轮选项）。
@@ -818,38 +1151,42 @@ window.__ModuleLoader__.load({
             ],
           })
         : null;
-      return jsx(primitives.Modal, {
-        open: target !== null,
-        title: t(`dialog.title.${mode}`),
-        closeLabel: t('dialog.cancel'),
-        onClose: () => controller.close(),
-        footer: jsxs(Fragment, {
+      return jsx('div', {
+        className: 'dshwd-confirm',
+        role: 'dialog',
+        'aria-modal': 'false',
+        children: jsxs('div', {
+          className: 'dshwd-confirmBox',
           children: [
-            jsx(primitives.Button, {
-              variant: 'ghost',
-              size: 'md',
-              disabled: view.pending,
-              onClick: () => controller.close(),
-              children: t('dialog.cancel'),
+            jsx('div', {
+              className: 'dshwd-confirmTitle',
+              children: t(`dialog.title.${mode}`),
             }),
-            jsx(primitives.Button, {
-              variant: 'primary',
-              size: 'md',
-              className: 'dshwd-danger',
-              disabled: view.pending,
-              onClick: () => controller.confirm(),
-              children: view.pending ? t('dialog.pending') : failure ? t('dialog.retry') : t('dialog.confirm'),
-            }),
-          ],
-        }),
-        children: jsxs(Fragment, {
-          children: [
             jsx('p', { className: 'dshwd-dialog-text', children: t(`dialog.desc.${mode}`) }),
             wholeTurnOption,
             jsx('p', { className: 'dshwd-dialog-note', children: t('dialog.note') }),
             failure === null
               ? null
               : jsx('p', { className: 'dshwd-dialog-error', role: 'status', children: t(`error.${failure}`) }),
+            jsxs('div', {
+              className: 'dshwd-confirmActions',
+              children: [
+                jsx('button', {
+                  type: 'button',
+                  className: 'dshwd-confirmBtn',
+                  disabled: view.pending,
+                  onClick: () => controller.close(),
+                  children: t('dialog.cancel'),
+                }),
+                jsx('button', {
+                  type: 'button',
+                  className: 'dshwd-confirmBtn dshwd-danger',
+                  disabled: view.pending,
+                  onClick: () => controller.confirm(),
+                  children: view.pending ? t('dialog.pending') : failure ? t('dialog.retry') : t('dialog.confirm'),
+                }),
+              ],
+            }),
           ],
         }),
       });
@@ -908,6 +1245,9 @@ window.__ModuleLoader__.load({
         () => () => {
           for (const controller of controllers.values()) controller.dispose();
           controllers.clear();
+          // 卸载时**必须**把自己注入的宿主节点扫掉：行 DOM 由宿主维护、不随插件卸载而重建，
+          // 留在行里就成了下一次 apply 的幽灵按钮（见 wm-delete-reapply.test.mjs）。
+          sweepOwnHosts();
         },
         'wm-delete: per-session controllers',
       );

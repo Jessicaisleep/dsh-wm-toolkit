@@ -4,6 +4,356 @@
 半边各自的详细变更史保留在 `parts/recall/CHANGELOG-WM.md` 与 `parts/manager/CHANGELOG.md`；
 本文件只记录**面向使用者**的包级版本。
 
+## 0.2.20 — 2026-10-28
+
+### 修：AI 回复**顶部**的删除按钮没恢复（0.2.19 砍错了）
+
+顶部那个按钮在「已完成分析 / 用时 N 秒」这条**回合披露行**上。0.2.19 我照抄上游
+`dsh-delete-turn` 的注释（"process row 故意不给入口，否则只是重复同一 scope"），
+把 `turn-process` 的删除入口直接 `return null` 了。
+
+**这是错的**，而且和我们自己早先的结论相反：那次讨论的结论是**每段对应一个删除按钮，
+不是多余**——顶部披露行与底部操作条是同一段的两个入口。当时"点哪个都一样"的根因是
+**单段回合里删这一段本来就等于删整轮**，不是按钮重复。
+
+现在恢复 `turn-process` 的入口，并保证它**精确指向这一段**：
+
+- 有 `data.answerAnchorSeq`（宿主下发，锚在该段答案上）→ 直接用它；
+- 没有锚点时 → 兜底取**该回合最后一段的段尾 seq**（新增 `lastSegmentTailOfTurn`），
+  **绝不退回 `turn`** —— 那会把"删这一段"静默扩成"删整轮"。
+
+### 测试
+
+`wm-delete-placement` 29 → **30/30**，新增/改写 2 条：
+
+| 用例 | 关掉实现后的读数 |
+|---|---|
+| 回合披露行**要有**删除按钮（顶部那个） | 失败（这正是本次回归） |
+| 披露行没有锚点时兜底指向**最后一段段尾**，不退回整轮 | 失败 |
+
+R5 量具自检：把 `turn-process` 改回 `return null` → 这两条立刻失败（28/30，退出码 1）。
+
+全量：`node tests/run-all.mjs` → **24/24 套通过**（退出码 0）；真实日志跑前跑后行数不变。
+
+### 一条流程教训
+
+连续两轮都是**照抄上游注释**造成的回归（先砍 `turn-process`、再把"有 messageId 就让出"
+套到所有段）。上游的取舍基于它自己的设计目标；我们的目标是"每段一个入口、点得到、
+删得准"。**遇到与上游不一致时，以我们自己验证过的结论为准，上游注释只当参考。**
+
+## 0.2.19 — 2026-10-28
+
+三个真机反馈，逐个修。
+
+### 修：确认对话框锁死 DSH，长段落没法翻看要删的范围
+
+`primitives.Modal` 是**模态**对话框，会把整个 DSH 窗口锁住（滚动也锁）。而删除线预览的全部
+意义就是"落刀之前看清楚"——划出 100+ 个节点的长段落时，用户根本翻不到下面去看自己删的是什么。
+
+改为**非模态底部浮层**（`dshwd-confirm`）：不接管焦点、不锁滚动、不遮正文，固定在输入框上方；
+取消/删除按钮在浮层内。用户可以一边上下翻看划了删除线的段落，一边决定删不删。
+（仍保留 `role="dialog"`，但明确标 `aria-modal="false"`。）
+
+### 修：只有最底部的删除按钮回来了，头部/中间段的都没了
+
+0.2.18 的判据是「这一行带 `messageId` 就交给官方槽」。但**官方槽只在回合末尾那一行渲染**，
+覆盖不到中间段 —— 于是多段回合的中间段全部失去入口，真机表现就是"只剩最底部一个按钮"。
+
+改成按**段**判断：只有"本回合的**最后一段**"才让给官方槽，中间段仍由行内入口顶上。
+判据用宿主报出的 `segmentWindows`（取该回合各段 `endSeq` 的最大值），不再看 messageId 有无。
+
+### 修：官方槽点开的确认框没有删除线
+
+底部按钮走官方槽，`controller.open` 只带 **`messageId`**，而 `pendingSeqsFor` 只认 `seq` /
+`turn` —— 于是匹配不到任何段，一条线都划不出来。（用户指令走 `seq`，所以那条正常。）
+
+- 宿主 `/state` 新增 `messageIdsBySeq`（surface seq → messageId）；
+- 浏览器半边用它在"官方槽的 messageId"与"段窗口的 seq"之间换算，换算不出就**不划线**
+  （宁可不说，也不划错）。
+
+### 修：日志里 `"version":"0.1.0"`（看起来像装错了包）
+
+`readPackageVersion()` 在 `parts/delete/lib/index.js` 里执行，`here` 是 `parts/delete/lib`。
+往上两级读到的是 `parts/delete/package.json` —— 那是**上游** dsh-delete-turn 的 `0.1.0`。
+正确是往上**三级**到本包根。0.2.18 那次修成了两级，只是把 `unknown` 换成了更误导的 `0.1.0`。
+
+### 测试
+
+24 套维持；`wm-delete-pending-preview` 7/7 → **9/9**、`wm-delete-placement` 26 → **29**、
+`wm-delete-log-hygiene` 7/7 → **8/8**。
+
+新增关键用例：
+- 官方槽（只带 messageId）也必须划线；映射不到段时**不瞎划**；
+- 多段回合的**中间段**即使带 messageId 也必须自己长按钮（正是本次回归）；
+- 注册记录里的 `version` 不得是 `unknown`、不得是上游 `0.1.0`。
+
+R5 量具自检：把版本路径退回两级 → `version` 用例立刻失败（抓到 `0.1.0`）。
+
+全量：`node tests/run-all.mjs` → **24/24 套通过**（退出码 0）；真实日志跑前跑后行数不变。
+
+## 0.2.18 — 2026-10-28
+
+### 紧急修：重启后**所有**删除按钮消失（0.2.17 引入）
+
+现象：重启 DSH 后，助手操作条上连**官方槽**的删除按钮都不见了——不只是行内注入的那几个。
+这是 0.2.17 引入的回归，根因在 `getSnapshot()`。
+
+`0.2.17` 为了让测试读得到防重入锁，把快照改成了：
+
+```js
+getSnapshot = () => ({ ...this.view, confirmInFlight: this.confirmInFlight === true });
+```
+
+React 的 `useSyncExternalStore` 对 `getSnapshot()` 反复求值并做 **`Object.is` 比较**；
+每次返回**新对象**就会被判定成"状态一直在变"，重渲染到 React 抛错
+（`The result of getSnapshot should be cached`），于是**整个槽渲染崩溃** ——
+挂在这个槽上的官方操作条按钮跟着一起消失，而行内注入也因为同一轮渲染中断而没跑。
+
+修法：`getSnapshot` 恢复成返回 `this.view` 本身（稳定引用），并让 `confirmInFlight`
+**写进 view、随 publish 一起发布**，不再作为临时派生字段。`view` 里的字段也从
+`inFlight` 改名为 `confirmInFlight`（避免与 `/state` 去重那个 `inflight` 混淆）。
+
+新增回归用例守着这条：两次调用必须 `assert.equal(a, b)`（同一引用），状态变化后才换引用。
+
+> 这条 bug 的特征值得记住：**它不报错给用户看，只是"什么都没有"**。
+> 如果只看宿主日志，三条半边全都"已应用"，完全正常——问题只在浏览器侧。
+
+### 修：日志里的 `"version":"unknown"`
+
+`readPackageVersion()` 里路径多退了一级：本文件在 `<包根>/lib/index.js`，包根的
+`package.json` 是 `join(here, '..')`，而代码写成了 `join(here, '..', '..')`，
+指向**工作区根**（那里没有 package.json），于是 `catch` 里返回 `unknown`。
+已改为一级并在注释里写明为什么。
+
+### 测试
+
+24 套维持，`wm-delete-reentry.test.mjs` 6/6 → **8/8**（新增 2 条）：
+getSnapshot 引用稳定性、`confirmInFlight` 随 view 发布。
+
+R5 量具自检：把 `getSnapshot` 改回每次返回新对象 → 新增用例立刻失败（"必须返回同一个引用"）。
+
+全量：`node tests/run-all.mjs` → **24/24 套通过**（退出码 0）；
+跑全量前后真实 `dsh-wm-delete.log` 行数不变（测试隔离仍然有效）。
+
+## 0.2.17 — 2026-10-28
+
+### 更正：0.2.16 里「一天重载 320 次」的说法是错的
+
+那是**整个日志文件自 9 月以来的累计**，不是单日；而且「同一秒多条记录」**不是插件重载**，
+是**我自己新写的测试在往真实日志里写**。实测真实 apply：10-27 当天只有 **6 次**，
+相邻间隔 `34394s / 2248s / 53s / 46112s / 83s`，**没有任何 ≤5 秒的连发**。
+
+污染来源：`wm-delete-stop-first` / `pending-preview` / `reentry` 三套测试每次 `apply()`
+都会触发 `logLine('已注册')`，而它们**没有隔离 `DSH_HOME`** —— 20 分钟里留下 23 条假记录，
+`session-8c5d8123`（测试常量）相关事件累计 110 条、`startSeq:4` 重复 29 次。
+`wm-delete-host.test.mjs` 早就做过隔离，新写的三套漏了。
+
+### 修：测试不再污染生产日志
+
+- 三套测试统一在 import 之前把 `DSH_HOME` 指到 `mkdtempSync` 临时目录；
+- 并设 `WM_DELETE_TEST=1`，让写出的记录带 `test: true`——即使有人把目录指回真实的，
+  也能一眼把假数据摘出去；
+- 验证方式用**磁盘账本**而不是"看起来没有"：跑全量 24 套前后，真实
+  `$DSH_HOME\dsh-wm-delete.log` 保持 **3 227 行 / 742 616 B / sha256 不变**。
+
+### 修：日志降噪 + 体积上限
+
+- **「已注册」默认只在同进程同目录写一次**（键含 `DSH_HOME` 与版本）。以前每次 apply
+  都写一条，一天几十次重载就把日志刷成流水账。键里**必须带日志目录**：否则换了
+  `DSH_HOME`（测试反复改指向、或多 profile 实例）那些目录会永远没有这条记录
+  —— 这是第一版实现踩到的坑，被 `wm-delete-log-hygiene` 用例当场抓住。
+- 注册记录带上 `version`，便于对齐"这条是哪一版写的"。
+- **`MAX_LOG_BYTES = 4 MiB`**：超过就把现役文件轮转成 `.log.1`（只留一代，旧的直接覆盖），
+  与 0.2.14 给 recall 日志加的轮转同一个思路。
+- 「卸载」照旧每次都记：它与注册成对，是排查"HMR 是否真的重载过"的关键证据。
+- `logHome()` 改为每次调用时读 `process.env.DSH_HOME`，**不在模块顶层缓存**
+  （缓存会让测试切目录后仍然写第一个目录）。
+
+### 测试
+
+23 套 → **24 套**，新增 `wm-delete-log-hygiene.test.mjs`（7/7）：
+
+| 用例 | 关掉实现后的读数 |
+|---|---|
+| 测试环境 DSH_HOME 已隔离 | — |
+| `WM_DELETE_TEST=1` → 记录带 `test: true` | — |
+| 生产模式 → 记录不带 `test` | — |
+| 同进程反复 apply 5 次 →「已注册」只 1 条 | **5 条**（4/7 → 7/7 的分水岭） |
+| 卸载仍照常记录 | — |
+| 超 4 MiB → 轮转成 `.log.1` | 不生成 `.log.1` |
+| 第二次轮转覆盖旧的 `.log.1` | `ENOENT` |
+
+全量：`node tests/run-all.mjs` → **24/24 套通过**（退出码 0）。
+
+## 0.2.16 — 2026-10-28
+
+四件事：删除按钮"藏进折叠壳"、同一段落三四个删除按钮、确认框看不见要删什么、生成中删除几乎必然超时。
+全部先量后改，每处都有"关掉实现必须失败"的量具自检。
+
+### 修：一段回复「没有删除按钮」——按钮挂在了看不见的行上
+
+`replySegments` 取"该段最后一条 `assistant/message`"当段尾。但**纯工具调用的步骤**会落一条
+**文本为空**的 assistant，它在转录上不是助手气泡，而是被渲染成工具卡或「已完成分析」折叠分组。
+按钮挂上去就藏进折叠壳里——用户看到的现象就是"这一段删不掉、根本没有删除按钮"。
+
+实测（`session-312b7db9` turn 12 第 3 段）：段尾算出来是 `seq 1506`，而该段里最后一条**有可见文本**
+的 assistant 在 `1499`；`1506` 之前的 `1492` 正文是空字符串。
+
+现在 `replySegments` 增加 `tailSeq`：优先取**最后一个有可见文本的 assistant**，整段都没有文本时
+回落到最后一个 assistant，再不行回落段尾节点。宿主通过 `segmentTails` 报给浏览器，按钮因此总落在
+用户看得见的那一行上。同时新增 `segmentWindows`（每段的遮蔽窗口），供下面的预览使用。
+
+### 修：同一段落三四个删除按钮（官方槽 + 行内注入重复）
+
+真机抓到同一段落 **3 个**删除按钮：官方槽 `conversation.chat.assistant-actions` 一个、行内
+`assistant-step` 注入一个、「已思考 / 用时 N 秒」过程折叠条再一个。上游 `dsh-delete-turn`
+对这两处都是**刻意不给**（源码注释里写明"a second icon there would only duplicate the same scope"），
+我们在移植时把"每段都要有入口"过度应用了。
+
+- `assistant-step`：补上上游判据 —— `finalNode.messageId !== undefined` 时返回 null（交给官方槽）。
+  实测三段的回合里，每段段尾 messageId 都能**精确落到该段**（6 / 4 / 11 个节点，不越界），
+  所以交给官方槽不会丢精度。
+- `turn-process`（「已思考 / 已完成分析 / 用时 N 秒」）：**一律不给**删除入口。
+- 判据顺序：`segmentTails` 还没抓回来时**先乐观放行**（排在 messageId 判据之前），
+  否则 surface 未就绪时会凭空少掉按钮。
+
+> 顺带澄清一个误解：**单段回合**里"删这一段"必然等于"删这一轮的全部 AI 回复"（提问仍保留），
+> 三个按钮点下去结果当然一样。实测 `turn 3` 只有 1 段、70 个节点，点任何一个 assistant 都规划出
+> 同一窗口 `[502..685]`。这**不是**范围被静默放大。
+
+### 新：确认框出现时，先把"将被删除的段落"划上删除线
+
+点删除 → 弹确认框 → **在转录上看到哪几行会被划掉**，确认无误再落刀；点取消，标记随之消失。
+
+实现要点（`parts/delete/lib/client.js`）：
+
+- 只加 `data-dshwd-pending="1"`，视觉交给样式表（`text-decoration: line-through` + 8% 红色底）；
+- **绝不锁滚动**：不碰行与 `body` 的 `overflow` / `pointer-events`。DSH 的 Modal 自己会锁一层窗口，
+  插件再锁一层，长段落就没法翻着核对——这条有专门用例守着；
+- 勾选「同时删掉这一轮其它 N 段」时，该回合**全部段**一起划线；
+- surface 还没就绪时**不划线**（宁可不说，也不划错）；
+- 标记按命名空间属性清扫，只动本插件自己的节点。
+
+### 修：生成中删除几乎必然超时（15 秒 → 60 秒）
+
+真机实测（`session-8c5d8123`，2026-10-27 23:25–23:30）：连续 5 次生成中删除全部落到
+`stop-timeout`，用户点删除基本得不到结果。`dsh-wm-delete.log` 里 19 次"已请求停止当前回合"，
+绝大多数最终没删成——**15 秒是上游在它的环境里定的，不适用于流式生成 + 工具收尾的本机**。
+
+- `STOP_TIMEOUT_MS` 15 000 → **60 000**；
+- 超时错误文案从 `the running turn did not stop in time` 改成带可操作下一步的提示：
+  「已请求停止这一轮，但它在等待上限内还没停完。可以再点一次删除，或先点界面上的停止键手动停下，
+  然后再删。」（中英双语）
+- 客户端补上 `error.stop-timeout` 键——此前**根本没有这个键**，超时会显示原始错误码。
+
+### 修：删除请求防重入
+
+只靠 `view.pending` 不够：它是 `publish` 之后才生效的界面态，中间那一瞬（同一帧的两次调用、或
+`pending` 被另一次 publish 复位后请求仍在途）足够第二次请求发出去。
+
+新增同步实例锁 `confirmInFlight`（在第一个 `await` 之前置位，`finally` 里复位），并把
+`pending` 与锁分开表达；`getSnapshot()` 一并暴露 `confirmInFlight`，界面可据此禁用按钮而不必等 publish。
+命名上与原有的 `/state` 去重字段 `inflight` 明确区分（只差大小写，容易踩）。
+
+### 测试
+
+21 套 → **23 套**（新增 2 套；另有 2 套既有用例扩展）：
+
+| 套 | 覆盖 | 关掉实现后的读数 |
+|---|---|---|
+| `wm-delete-pending-preview.test.mjs` | 删除线预览：窗口内划线 / 窗口外不划 / 整轮全划 / 取消即消失 / 不锁滚动 / 未就绪不划 | 3/7 |
+| `wm-delete-reentry.test.mjs` | 防重入（含"pending 已复位仍在途"这一只有锁能挡的场景）+ 60s 预算 + 可操作文案 | 1/6 首条必失败 |
+| `wm-delete-placement.test.mjs`（扩展） | 官方槽已覆盖段尾时不重复长按钮；过程折叠条一律不给 | — |
+| `wm-delete-reentry.test.mjs` 的锁用例 | 去锁后"普通连点"仍通过、**"pending 已复位仍在途"失败**（2 个请求） | 准确区分两个门槛 |
+
+全量：`node tests/run-all.mjs` → **23/23 套通过**（退出码 0）。
+
+### 未做（需要新决策）
+
+`dsh-wm-delete.log` 显示本机一天内该半边被重新 apply **320 次**，多次挤在同一秒
+（如 15:25:40 有三条「半边已注册」+ 三条「删除已落地」，`replacementSeq` 全为 7）。
+这是 **HMR / 插件重载**在反复触发 apply，不是用户连点，防重入锁挡不住。
+重载本身是否需要收敛（以及是否值得做"同进程内同一删除只落地一次"的幂等守卫），需要单独定。
+
+## 0.2.15 — 2026-10-27
+
+对齐上游 `dsh-delete-turn` 0.1.6 / 0.1.7 / 0.1.12 / 0.1.13 与 `dsh-session-manager` 0.7.5 的
+安全与正确性修复（取证见 `_logs/upstream-probe/`）。四件事，都是先量后改。
+
+### 安全：manager 的 `/session-manager/api/*` 原先没有任何鉴权
+
+webServer 的 dispatch 是**最长前缀优先**，本插件注册的 `/session-manager/api` 比内核的
+`/api` 更长 —— 这些路由因此跑在连接层自己的准入检查**之前**，不设防就等于任何回环调用方
+都能删会话、搬工作区目录（`parts/manager/lib/index.js` 里此前 `admit` / `remoteAddress` /
+`isLoopback` 三个符号一个都搜不到）。
+
+现在：连接层在位就用它（`connection.admit`，与内核给 `/api` 用的是同一份决定），
+**非 owner 主体一律 403**；服务缺席或读取抛错时 **fail-closed 503**（绝不放行）；
+服务返回空读作 401。老宿主（dsh < 0.1.7）的 `requestRejection` 拼法同时认，
+不会因为拼法不同就把每个请求读成 503。连接层没有给出决定时，结构栅栏接手：
+回环 Host、拒绝 `sec-fetch-site: cross-site`、Origin/Referer 必须与 Host 同源
+（并保留桌面端 `dsh-app://app` 中继 Referer 的窄例外）。
+鉴权发生在**读 body 之前**。
+
+> 这条实现按本仓库 `dsh-our-free-model/src/trust.js` 的双代兼容写法移植，没有照抄上游 ——
+> 上游只认 `admit` 一种拼法，在更老的宿主上会一律 503。
+
+### 修：删「整轮」时窗口可能覆盖系统提示词头（surface 节点 0）
+
+宿主**每轮都重写系统提示词头**，重写后的头带的是当前轮号。旧判据只拦"被点的那个目标是
+不是节点 0"，而整轮删除（`scope: 'turn'`）**不依赖目标还在场**，窗口完全由分段算出来 ——
+目标在节点 1、窗口起点却可能是节点 0。官方 append 契约只允许用 `system/message` 精确改写
+节点 0，而删除载体是 turn-less 的 `user/message`，这样的窗口会被拒或改错节点。
+
+现在 `step` 与 `reply` 两条规划路径都按**窗口起点**拦（`assertWindowOffHead`），
+与上游 0.1.12 的判据一致。同时保住原有守卫：提示词头本身仍不可删。
+
+### 改：生成中删除 = 先停这一轮，再删
+
+以前回合进行中只回 `409 busy`。现在走官方 `sessionController.cancel`（与界面停止键同一条路，
+**保留排队输入**），等 `turn/end` 真正落定后再**重新读日志**、再规划窗口、再追加替换事件；
+默认等待上限 15 秒，超时回 `stop-timeout` 且**不落地任何替换事件**。
+正在压缩（没有"停止"语义）时仍是 `busy`，不调 cancel。
+
+> 顺序是重点：cancel 只是受理，循环还要收尾（provider 流取消 → 工具结果按序提交 →
+> 残缺答案以 `interrupted: true` 落地 → `turn/end` 追加并 flush）。不等闭合就规划，
+> 算出来的 seq 立刻过期。
+
+### 修：不再把兄弟插件藏着的行显示出来（隐藏归因）
+
+`setRowHidden` 的恢复分支原先是**无条件** `row.style.display = ''` —— 正被
+`dsh-edit-turn`（`data-dshet-hidden`）/ `dsh-rerun-turn`（`data-dsrr-hidden`）/
+上游 `dsh-delete-turn`（`data-dshdt-hidden`）藏着的行会突然复活。
+现在交还自己那份折叠样式之前先查 `foreignHideOn(row, 'dshwd')`：有别人的归属就保持
+`display:none`，等对方自己解除；本插件自己的 `dshwd` 归属跳过，不会把自己锁死。
+
+### 修：重新 apply 不再叠幽灵按钮（HMR / 插件开关）
+
+本插件的 `injectRowAction` 用 `rowActions` WeakMap 保证**同一实例内**每行一个宿主，
+但每次 apply 都是新模块实例、新 WeakMap，而上一次 apply 注入的宿主还留在行里 ——
+卸载时 `dispose()` 也没有扫掉它们。
+
+改前实测（`parts/delete/tests/wm-delete-reapply.test.mjs`）：**1/4 通过** ——
+dispose 后行里残留 1 个孤儿宿主，再 apply 后变成 2 个。
+
+现在：宿主带命名空间属性 `data-dshwd-action-host="1"`，注入前先认领上一次留下的节点
+（属性优先、类名兜底），不再 remove + re-insert；卸载时按命名空间扫掉全部自己注入的
+宿主，宿主与兄弟插件的节点一律不动。改后 **4/4 通过**。
+
+### 测试
+
+16 套 → **21 套**，新增 5 套（都做过"关掉实现必须失败"的量具自检）：
+
+| 套 | 覆盖 | 关掉实现后的读数 |
+|---|---|---|
+| `wm-manager-api-auth.test.mjs` | 鉴权门：fail-closed / owner-only / 双代拼法 / 结构栅栏 | 1/12 |
+| `wm-delete-head-window.test.mjs` | 头窗口守卫（step + reply 双路径） | 5/6 |
+| `wm-delete-stop-first.test.mjs` | 先停后删的顺序、超时不落地、压缩不取消 | 2/5 |
+| `wm-delete-foreign-hide.test.mjs` | 隐藏归因（不显示别人藏着的行） | 2/6 |
+| `wm-delete-reapply.test.mjs` | 重新 apply 不叠宿主、卸载不留孤儿 | 1/4 |
+
+全量：`node tests/run-all.mjs` → **21/21 套通过**（退出码 0）。
+
 ## 0.2.14 — 2026-10-25
 
 ### 修：DSH 0.2.1-rc.3 起，带图片附件的用户消息一张图都不显示

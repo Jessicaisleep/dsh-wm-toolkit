@@ -77,11 +77,28 @@ class FakeElement {
   set className(value) {
     this.attributes.class = value;
   }
+  /** `data-*` → dataset 的驼峰键（`data-dshwd-hidden` → `dshwdHidden`），与真实 DOM 一致。 */
+  static datasetKey(name) {
+    if (!name.startsWith('data-')) return null;
+    const rest = name.slice('data-'.length);
+    if (rest === '') return null;
+    return rest.replace(/-([a-z])/g, (_, ch) => ch.toUpperCase());
+  }
   setAttribute(name, value) {
     this.attributes[name] = String(value);
+    const key = FakeElement.datasetKey(name);
+    if (key !== null) this.dataset[key] = String(value);
   }
   getAttribute(name) {
     return name in this.attributes ? this.attributes[name] : null;
+  }
+  hasAttribute(name) {
+    return name in this.attributes;
+  }
+  removeAttribute(name) {
+    delete this.attributes[name];
+    const key = FakeElement.datasetKey(name);
+    if (key !== null) delete this.dataset[key];
   }
   appendChild(child) {
     if (child.parentElement) child.parentElement.removeChild(child);
@@ -116,7 +133,7 @@ class FakeElement {
   }
 }
 
-/** 支持 tag、[attr]、[attr="v"]、[attr*="v"]（本测试用到的那几种形状）。 */
+/** 支持 tag、[attr]、[attr="v"]、[attr*="v"]、.class（本测试用到的那几种形状）。 */
 function matches(element, selector) {
   const tag = /^([a-zA-Z][a-zA-Z0-9-]*)/.exec(selector);
   let rest = selector;
@@ -125,7 +142,15 @@ function matches(element, selector) {
     rest = selector.slice(tag[1].length);
   }
   const attrPattern = /^\[([a-zA-Z-]+)(?:([*^$]?=)"([^"]*)")?\]/;
+  const classPattern = /^\.([a-zA-Z][a-zA-Z0-9_-]*)/;
   while (rest.length > 0) {
+    const classFound = classPattern.exec(rest);
+    if (classFound) {
+      const classes = String(element.attributes.class || '').split(/\s+/).filter(Boolean);
+      if (!classes.includes(classFound[1])) return false;
+      rest = rest.slice(classFound[0].length);
+      continue;
+    }
     const found = attrPattern.exec(rest);
     if (!found) throw new Error(`迷你 DOM 不支持的选择器：${selector}`);
     const [, name, op, value] = found;
@@ -577,6 +602,9 @@ check('每段回复都有自己的删除按钮：段尾助手行有，段中间�
   documentRoot.children.length = 0;
   const { component, controller } = mount();
   // 一个回合被插话切成两段：段1 = 步骤1~2（段尾 seq 40），段2 = 步骤3（段尾 seq 50）
+  //
+  // 这里**故意不给 finalNode 带 messageId**：真机上段尾多半带 messageId，那种情况下
+  // 官方助手操作条已经在那行渲染了删除入口，行内不再重复挂（见下面单独那条用例）。
   const midRow = bareRow('s1', 30);
   const tailRow = bareRow('s2', 40);
   const otherTail = bareRow('s3', 50);
@@ -587,9 +615,9 @@ check('每段回复都有自己的删除按钮：段尾助手行有，段中间�
     segmentsByTurn: { 1: 2 },
   });
   render(component, controller, {
-    s1: { kind: 'assistant-step', anchorSeq: 30, data: { turn: 1, step: 1, finalNode: { seq: 30, messageId: 'm30' } } },
-    s2: { kind: 'assistant-step', anchorSeq: 40, data: { turn: 1, step: 2, finalNode: { seq: 40, messageId: 'm40' } } },
-    s3: { kind: 'assistant-step', anchorSeq: 50, data: { turn: 1, step: 3, finalNode: { seq: 50, messageId: 'm50' } } },
+    s1: { kind: 'assistant-step', anchorSeq: 30, data: { turn: 1, step: 1, finalNode: { seq: 30 } } },
+    s2: { kind: 'assistant-step', anchorSeq: 40, data: { turn: 1, step: 2, finalNode: { seq: 40 } } },
+    s3: { kind: 'assistant-step', anchorSeq: 50, data: { turn: 1, step: 3, finalNode: { seq: 50 } } },
   });
   // 段尾行：有「删除这条回复」按钮，点它删的就是这一段（scope 由确认框决定，默认这一段）
   const tailButton = tailRow.row.querySelector('[class*="dshwd-row-action"]');
@@ -607,6 +635,117 @@ check('每段回复都有自己的删除按钮：段尾助手行有，段中间�
   controller.dispose();
 });
 
+check('官方槽已覆盖段尾（本回合**最后一段**且带 messageId）时不再重复长行内按钮', () => {
+  documentRoot.children.length = 0;
+  const { component, controller } = mount();
+  const tailRow = bareRow('u1', 40);
+  controller.publish({
+    surfaceReady: true,
+    surface: new Set([40]),
+    segmentTails: new Set([40]),
+    segmentsByTurn: { 1: 1 },
+    // 判"是不是最后一段"要用 segmentWindows（官方槽只长在回合末尾那一行）。
+    segmentWindows: [{ turn: 1, startSeq: 40, endSeq: 40, shadowed: [40] }],
+  });
+  render(component, controller, {
+    u1: { kind: 'assistant-step', anchorSeq: 40, data: { turn: 1, step: 1, finalNode: { seq: 40, messageId: 'm40' } } },
+  });
+  // 官方助手操作条（conversation.chat.assistant-actions）会在同一行提供删除入口；
+  // 行内再挂一个就是同一段落两个功能相同的按钮（真机上曾同时出现 3 个）。
+  assert.equal(
+    tailRow.row.querySelector('[class*="dshwd-row-action"]'),
+    null,
+    '最后一段的段尾已由官方槽覆盖，行内不再重复挂',
+  );
+  controller.dispose();
+});
+
+check('多段回合的**中间段**：即使带 messageId 也必须自己长按钮（官方槽只覆盖末尾）', () => {
+  documentRoot.children.length = 0;
+  const { component, controller } = mount();
+  const midRow = bareRow('m1', 40);
+  const lastRow = bareRow('m2', 80);
+  controller.publish({
+    surfaceReady: true,
+    surface: new Set([40, 80]),
+    segmentTails: new Set([40, 80]),
+    segmentsByTurn: { 1: 2 },
+    segmentWindows: [
+      { turn: 1, startSeq: 30, endSeq: 40, shadowed: [30, 40] },
+      { turn: 1, startSeq: 70, endSeq: 80, shadowed: [70, 80] },
+    ],
+  });
+  render(component, controller, {
+    m1: { kind: 'assistant-step', anchorSeq: 40, data: { turn: 1, step: 1, finalNode: { seq: 40, messageId: 'm40' } } },
+    m2: { kind: 'assistant-step', anchorSeq: 80, data: { turn: 1, step: 2, finalNode: { seq: 80, messageId: 'm80' } } },
+  });
+  // 回归：真机上曾因为"只要带 messageId 就让出按钮"，导致多段回合只剩最底部一个按钮。
+  assert.ok(
+    midRow.row.querySelector('[class*="dshwd-row-action"]'),
+    '中间段必须有自己的行内删除按钮（官方槽覆盖不到它）',
+  );
+  assert.equal(
+    lastRow.row.querySelector('[class*="dshwd-row-action"]'),
+    null,
+    '最后一段仍交给官方槽，不重复挂',
+  );
+  controller.dispose();
+});
+
+check('「已完成分析 / 用时 N 秒」回合披露行**要有**删除按钮（每段一个入口，顶部那个）', () => {
+  documentRoot.children.length = 0;
+  const { component, controller } = mount();
+  const row = bareRow('p1', 70);
+  controller.publish({
+    surfaceReady: true,
+    surface: new Set([70]),
+    segmentTails: new Set([70]),
+    segmentsByTurn: { 1: 1 },
+    // rowDeletable 对 turn-process 走的是"该回合还有可删回复吗"，离不开 replyTurns。
+    replyTurns: new Set([1]),
+    segmentWindows: [{ turn: 1, startSeq: 70, endSeq: 70, shadowed: [70] }],
+  });
+  render(component, controller, {
+    p1: { kind: 'turn-process', anchorSeq: 70, data: { turn: 1, answerAnchorSeq: 70 } },
+  });
+  // 我们自己的结论是**每段对应一个删除按钮**：顶部披露行 + 底部操作条是同一段的两个入口，
+  // 不是重复。曾照抄上游把它去掉，真机上表现为"顶部那个按钮不见了"。
+  assert.ok(
+    row.row.querySelector('[class*="dshwd-row-action"]'),
+    '回合披露行必须有删除入口（它锚在这一段的答案上）',
+  );
+  controller.dispose();
+});
+
+check('回合披露行没有锚点时的兜底：指向**最后一段**，绝不退回整轮', () => {
+  documentRoot.children.length = 0;
+  const { component, controller } = mount();
+  const row = bareRow('p2', 70);
+  controller.publish({
+    surfaceReady: true,
+    surface: new Set([70, 80]),
+    segmentTails: new Set([80]),
+    segmentsByTurn: { 1: 2 },
+    replyTurns: new Set([1]),
+    segmentWindows: [
+      { turn: 1, startSeq: 60, endSeq: 70, shadowed: [60, 70] },
+      { turn: 1, startSeq: 75, endSeq: 80, shadowed: [75, 80] },
+    ],
+  });
+  render(component, controller, {
+    // 故意不给 answerAnchorSeq：走兜底分支
+    p2: { kind: 'turn-process', anchorSeq: 70, data: { turn: 1 } },
+  });
+  const button = row.row.querySelector('[class*="dshwd-row-action"]');
+  assert.ok(button, '没有锚点也要给入口');
+  button.onclick({ preventDefault() {}, stopPropagation() {} });
+  const dialog = controller.getSnapshot().dialog;
+  assert.equal(dialog.mode, 'reply');
+  // 必须是"最后一段的段尾 seq"（80），而不是整轮号——否则"删这一段"会被扩成"删整轮"。
+  assert.equal(dialog.seq, 80, '兜底应指向最后一段的段尾，不能退回 turn');
+  controller.dispose();
+});
+
 check('段信息还没抓回来时乐观放行（按钮先出现，抓到后再收敛到段尾）', () => {
   documentRoot.children.length = 0;
   const { component, controller } = mount();
@@ -617,6 +756,7 @@ check('段信息还没抓回来时乐观放行（按钮先出现，抓到后再�
   });
   // 没拿到段信息时不能把入口藏起来（否则用户以为又"没有删除按钮"）；
   // /state 回来之后 segmentTails 生效，只保留段尾那一行的按钮。
+  // 这条判据必须排在 messageId 判据之前 —— 还没抓 surface 时无法确认官方槽是否渲染。
   const button = row.row.querySelector('[class*="dshwd-row-action"]');
   assert.ok(button, '段信息缺失时应乐观放行');
   assert.equal(button.getAttribute('aria-label'), 'action.tooltip.reply');

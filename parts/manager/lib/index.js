@@ -221,6 +221,145 @@ export function apply(ctx) {
     res.end(JSON.stringify(obj));
   };
 
+  /* -------------------------------------------------------------- 请求鉴权
+   *
+   * webServer 的 dispatch 是**最长前缀优先**，而本插件注册的前缀（`/session-manager/api`）
+   * 比内核的 `/api` 更长 —— 这些路由因此跑在连接层自己的准入检查**之前**，
+   * 不设防的话任何回环调用方都能进来删会话、搬工作区。这个门把那条缝关掉。
+   *
+   * 两层，按序尝试：
+   *   1. 组合里真有 `connection` 服务就用它 —— 这就是内核给 `/api` 用的同一份准入决定
+   *      （信任栅栏 + 浏览器认证 cookie），插件因此永远不会比应用本身更弱；
+   *      owner 之外的 principal 一律拒绝（删会话/搬目录属于特权操作）。
+   *   2. 没有这个服务时用同一套栅栏的结构复刻：只认回环 Host、拒绝跨站取数、
+   *      客户端带了 Origin/Referer 就必须与 Host 同源。
+   *
+   * 两代拼法都要认（`admit` 与更老的 `requestRejection`）：只认 `admit` 的老宿主上
+   * 会把每一个请求都读成 503 —— 那是"鉴权不可用"，不是"请求有问题"。
+   */
+
+  /** 同一台机器上的调用方可以合法使用的 hostname。 */
+  const LOOPBACK_NAMES = new Set(["127.0.0.1", "[::1]", "::1", "localhost"]);
+
+  /**
+   * 把 Host/Origin/Referer 拆成 {scheme, hostname, port}；协议缺省时按 `http` 记。
+   * @returns {{scheme: string, hostname: string, port: string}|null}
+   */
+  const authorityOf = (value, defaultScheme) => {
+    if (typeof value !== "string" || value.trim() === "") return null;
+    let url = null;
+    try {
+      url = new URL(value.includes("://") ? value.trim() : `${defaultScheme ?? "http"}://${value.trim()}`);
+    } catch {
+      return null;
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    const port = url.port === "" ? (url.protocol === "https:" ? "443" : "80") : url.port;
+    return { scheme: url.protocol.replace(":", ""), hostname: url.hostname.toLowerCase(), port };
+  };
+
+  /** 只有本应用自己的页面，绝不是任意自定义协议页。 */
+  const isDesktopRelayReferer = (value) => {
+    try {
+      const url = new URL(value);
+      return url.protocol === "dsh-app:" && url.hostname === "app" && url.port === ""
+        && url.username === "" && url.password === "";
+    } catch {
+      return false;
+    }
+  };
+
+  /**
+   * 结构复刻的信任栅栏（与内核 `isTrustedApiRequest` 同形状）：
+   * Host 防 DNS rebinding、拒绝 `sec-fetch-site: cross-site`、Origin/Referer 权威比对。
+   * @returns 不以 403 拒绝时返回 undefined。
+   */
+  const structuralReason = (req) => {
+    const host = authorityOf(req.headers.host, "http");
+    if (host === null || !LOOPBACK_NAMES.has(host.hostname)) return "host-not-loopback";
+    const site = String(req.headers["sec-fetch-site"] ?? "").toLowerCase();
+    if (site === "cross-site") return "cross-site";
+    for (const header of ["origin", "referer"]) {
+      const raw = req.headers[header];
+      if (typeof raw !== "string" || raw.trim() === "") continue;
+      if (header === "referer" && isDesktopRelayReferer(raw)) {
+        // 桌面端 forwardWebRequest 会在转给 HTTP 回环之前抹掉两个浏览器标记，
+        // 但保留这个 Referer。它不是 Origin 授权，也绝不覆盖已挂载服务的鉴权决定。
+        if (req.headers.origin !== undefined || req.headers["sec-fetch-site"] !== undefined) {
+          return "desktop-relay-markers";
+        }
+        continue;
+      }
+      const authority = authorityOf(raw.trim());
+      if (authority === null) return `${header}-invalid`;
+      // web server 在回环上说的是明文 http，所以自称 https 的 Origin 不是这个页面。
+      if (authority.scheme !== host.scheme || authority.hostname !== host.hostname || authority.port !== host.port) {
+        return `${header}-mismatch`;
+      }
+    }
+    return undefined;
+  };
+
+  /** 连接层服务的晚绑定视图：组合可能在插件加载很久之后才发布它。 */
+  const connectionService = () => {
+    try {
+      return typeof ctx.get === "function" ? ctx.get("connection") : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  /**
+   * 判一个请求：返回要拒绝的 HTTP 状态，或 undefined 表示放行。
+   *
+   * fail-closed：服务在、但取准入时抛错 → 503（绝不因为"读不出决定"就放行）。
+   */
+  const rejectionFor = (req) => {
+    let decision;
+    try {
+      const connection = connectionService();
+      const admit = connection?.admit;
+      if (typeof admit === "function") {
+        const admission = admit.call(connection, req);
+        if (admission && typeof admission === "object") {
+          if ("rejection" in admission) {
+            const status = typeof admission.rejection === "number" ? admission.rejection : 401;
+            decision = { status, source: "connection", reason: "host-rejected" };
+          } else {
+            const principalKind = admission.peer?.principal?.kind;
+            // 会话删除 / 工作区搬目录属于特权操作：非 owner 一律拒绝。
+            if (principalKind !== "owner") {
+              decision = { status: 403, source: "connection", reason: "not-owner" };
+            }
+          }
+        } else {
+          // 空返回读起来像"没问题"，这里必须当成未授权。
+          decision = { status: 401, source: "connection", reason: "no-admission" };
+        }
+      } else if (typeof connection?.requestRejection === "function") {
+        // 老宿主（dsh < 0.1.7）把同一份决定放在这个名字下，返回的是裸状态码。
+        const status = connection.requestRejection(req);
+        if (status !== undefined) decision = { status, source: "connection", reason: "host-rejected" };
+      } else {
+        decision = { status: 503, source: "connection", reason: "auth-unavailable" };
+      }
+    } catch {
+      // 挂载的宿主服务抛错时绝不绕过浏览器鉴权。
+      decision = { status: 503, source: "connection", reason: "admission-error" };
+    }
+    if (decision === undefined) {
+      const reason = structuralReason(req);
+      if (reason !== undefined) decision = { status: 403, source: "structural", reason };
+    }
+    if (decision === undefined) return undefined;
+    try {
+      ctx.logger?.warn?.(`session-manager: 拒绝请求（${decision.source}/${decision.reason}）`);
+    } catch {
+      /* 诊断是旁观的，不能改变 HTTP 决定 */
+    }
+    return decision.status;
+  };
+
   /* [local patch 2026-09-30] 原工作区 ⋯ 菜单补丁调用已断开：官方桌面端把内置客户端包
      打进只读的 resources/app.asar，补丁连备份文件都写不出来，上游也没有工作区行菜单
      slot，保留调用只会持续报错。workspace-menu-patch.js、宿主 /workspace-migrate 路由
@@ -1503,6 +1642,20 @@ ${rest}`, "utf8");
     kind: "prefix",
     path: API_PREFIX,
     handler: async (req, res) => {
+      // 鉴权必须发生在**读 body、解析 JSON、任何业务操作之前**：这几条路由能删会话、
+      // 搬工作区目录，是特权面。详见函数上方的注释。
+      const rejected = rejectionFor(req);
+      if (rejected !== undefined) {
+        return send(res, rejected, {
+          ok: false,
+          code: rejected === 503 ? "auth-unavailable" : rejected === 403 ? "forbidden" : "unauthorized",
+          error: rejected === 503
+            ? "DSH 认证服务未就绪或不可用，为保护数据安全已拒绝请求"
+            : rejected === 403
+              ? "禁止访问：该操作需要 owner 权限且必须来自本机同源页面"
+              : "未授权：需要有效的 DSH 会话凭证",
+        });
+      }
       try {
         const url = new URL(req.url ?? "/", "http://localhost");
         const path = url.pathname.startsWith(API_PREFIX)
