@@ -4,6 +4,75 @@
 半边各自的详细变更史保留在 `parts/recall/CHANGELOG-WM.md` 与 `parts/manager/CHANGELOG.md`；
 本文件只记录**面向使用者**的包级版本。
 
+## 0.2.21 — 2026-11-06（适配 DSH 0.2.2-rc.1）
+
+### 新：「迁移工作区」搬进工作区行右键菜单
+
+DSH 0.2.2-rc.1 开了 `@deepseek-ai/dsh-client-ui-context-menu`，工作区行右键菜单从写死的
+`if (id !== "rename" && id !== "delete") return;` 变成可注册的数据项。迁移入口随之搬家：
+
+- `ctx.get("contextMenus").register({ id: "session-manager.migrate-workspace", target: "workspace", order: 200, resolve })`，
+  order 200 正好夹在官方「重命名」(100) 与「删除工作区」(300) 之间；
+- `resolve` 拿到的 `{ workspaceId, path, displayTitle }` 就是被右键那一行的工作区，
+  比原来「从会话快照猜当前工作区」准 —— 新增 `wmOpenMigrateForWorkspace()` 直接用它；
+- 图标走 `contextMenu.icon` 槽，key `session-manager.migrate-workspace`；
+- **老宿主兜底**：`ctx.get("contextMenus")` 取不到时仍注册 `sidebar.panellist.actions`
+  那一行（`WmMigrateMenuRow`），`engines.dsh` 里声明的老版本照旧有入口；
+- `package.json`：`dsh.client.inject` 加 `@deepseek-ai/dsh-client-ui-context-menu`，
+  `engines.dsh` 加 `|| ^0.2.2-rc.1`。
+
+### 修：`ConfirmDialog` 里一处必然抛 TDZ 的死代码
+
+`if (!body) return tree || null;` 写在 `const tree = ...` **之前** —— 只要 `document.body`
+不在（SSR、或早于 body 的时序），这里就抛 `ReferenceError: Cannot access 'tree' before initialization`，
+把整个 slot 拖崩。改成 `if (!body) return null;`（没有 body 就没有 portal 目标，内联渲染同样挂不上）。
+
+### 改：删除失败不再静默
+
+`runWithAlert` 原来只 `setNotice(...)`：气泡 8 秒自动消失、不写 console、不写日志，
+事后完全无从追查。现在 catch 里先 `reportClientError()` —— 写 `console.error`，
+并复用插件已有的同源日志通道 `POST /bubble/log`（tag `client`，落到
+`$DSH_HOME/dsh-message-recall-wm.log`）。
+
+### 修：**标题栏「删除会话」点了没反应** —— 弹层根本没画到屏幕上
+
+这是这次最花的坑，症状与根因完全不像一回事。
+
+**症状**：标题栏那个「删除会话」按钮（`sm-headerBtn sm-headerBtnDanger`）点下去，
+界面上什么也不出现；但用 UI Automation 去读，确认框**明明在无障碍树里**：标题、
+会话 id、取消/确认按钮全都有，`boundingBox` 也在屏幕内，甚至能 Invoke 到「确认删除」
+并真的把会话删掉。`printwindow` 与 `scope:desktop` 两种抓屏都拍不到它。
+
+**根因**：`window.__smReactDOM = React.createPortal ? React : null` ——
+`createPortal` 是 **react-dom** 的 API，不在 react 核心包上。所以这个表达式恒为 `null`，
+`ConfirmDialog` 里 `R.createPortal` 永远是 `null`，弹层一直走 **inline 兜底分支**，
+作为侧栏 slot 组件子树里的普通子元素被祖先的 `overflow:hidden` / 层叠上下文裁掉。
+UIA 按几何判定元素可见，于是「树里有、屏上没有」。
+
+**定位手段**（以后同类问题照抄）：在 `ConfirmDialog` 里挂一个只在 `open` 时跑的
+`useEffect`，把 `getBoundingClientRect()` 与 `getComputedStyle` 的
+position/display/opacity/zIndex/inset/transform/overflow/clipPath 经 `reportClientError`
+落到 `dsh-message-recall-wm.log`。日志一眼就看出 `parent.tag === "DIV"`（而不是 `BODY`）
+—— 说明没 portal 出去。修完再看同一条日志，`parent.tag` 变成 `BODY`。
+
+**修法**：
+- 模块顶部从 `react-dom` 取真正的 `createPortal`，存进 `window.__smCreatePortal`，
+  `window.__smReactDOM` 也改成存 react-dom 模块本身（以前存的是 react 核心）；
+- 新增 `smPortalInto(tree, createPortal)` 与 `smResolveCreatePortal()` 两个小工具，
+  **ConfirmDialog / MoveDialog / MigratePresetDialog 三个弹层统一走 portal** ——
+  后两个以前根本没 portal，同样会被裁（只是没人报过）。
+
+### 验证
+
+- `node build.mjs` → `lib/client.js` 363,130 字节、3 个半边；
+- `node --check lib/client.js` exit 0；`node tests/run-all.mjs` → **24/24 套通过**；
+- 真机 UIA：右键 `DSH工作区` → 菜单出现「迁移工作区…」，位于「删除工作区」正上方；
+  点击后弹出迁移对话框（「当前路径：D:\DSH工作区」+「选择文件夹…」）；
+  旧的「更多」菜单里只剩官方两项，双入口已清除。
+- 真机复现「删除会话」：点标题栏按钮 → **截图里能看到确认框**（修复前一个像素都没有）；
+  点「确认删除」→ 工件目录与 projcache 双双消失、侧栏该行消失。
+  验收用的会话是临时新建的，不涉及用户数据。
+
 ## 0.2.20 — 2026-10-28
 
 ### 修：AI 回复**顶部**的删除按钮没恢复（0.2.19 砍错了）

@@ -1,6 +1,6 @@
 {
     "name":  "dsh-session-manager-wm",
-    "version":  "0.4.11+wm.1",
+    "version":  "0.4.12+wm.1",
     "description":  "[fork of dsh-session-manager 0.4.11, renamed so upstream updates cannot overwrite it] 在 DSH 中管理会话（删除/归档/跨工作区移动/预设迁移），并新增“工作区文件夹迁移”：文件夹搬家或改名后，一键修复工作区记录、每条会话的 cwd 与日志物理位置。",
     "license":  "MIT",
     "keywords":  [

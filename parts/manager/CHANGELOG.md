@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.4.12+wm.1 — 2026-11-06（适配 DSH 0.2.2-rc.1）
+
+- **feat(migrate)**: workspace-folder migration entry moves from `sidebar.panellist.actions`
+  to the official workspace context menu. DSH 0.2.2-rc.1 ships
+  `@deepseek-ai/dsh-client-ui-context-menu`, whose `contextMenus` service makes the
+  workspace row's `⋯` menu a registerable list instead of a hardcoded
+  `if (id !== "rename" && id !== "delete") return;`. The plugin registers
+  `{ id: "session-manager.migrate-workspace", target: "workspace", order: 200, resolve }`
+  — order 200 lands between the shipped `workspace.rename` (100) and
+  `workspace.delete` (300). `resolve` receives the captured
+  `{ workspaceId, path, displayTitle }` of the row that was right-clicked, so the new
+  `wmOpenMigrateForWorkspace()` no longer has to guess the current workspace from the
+  session snapshot (the old `wmCurrentWorkspaceChoice` 4-step fallback is only used by
+  the legacy "更多" row now). The icon goes through the `contextMenu.icon` slot under
+  key `session-manager.migrate-workspace`. `dsh.client.inject` gains
+  `@deepseek-ai/dsh-client-ui-context-menu`; `engines.dsh` gains `|| ^0.2.2-rc.1`.
+  Older hosts keep working: when `ctx.get("contextMenus")` returns nothing, the old
+  `sidebar.panellist.actions` row (`WmMigrateMenuRow`) is registered instead.
+
+- **fix(dialog)**: `ConfirmDialog` referenced `tree` before its `const` declaration —
+  `if (!body) return tree || null;` sat one line above `const tree = h("div", ...)`.
+  Whenever `document.body` was absent that path threw a TDZ `ReferenceError` and took
+  the whole slot down with it. Now `if (!body) return null;` (no body means no portal
+  target; inline rendering cannot mount either).
+
+- **fix(diagnostics)**: `HeaderAction`'s `runWithAlert` swallowed failures into an
+  8-second notice bubble with no console output and no log line, so a failed delete left
+  no trace at all. It now calls the new `reportClientError()`, which writes
+  `console.error("[dsh-session-manager]", ...)` and POSTs to the plugin's existing
+  same-origin `/bubble/log` route (tag `client`, lands in
+  `$DSH_HOME/dsh-message-recall-wm.log`).
+
+- **fix(portal)**: the title-bar "delete session" button appeared to do nothing, yet
+  UI Automation saw a fully-formed confirm dialog (title, session id, cancel/confirm
+  buttons, in-viewport bounding boxes) and invoking the confirm button really deleted
+  the session. Root cause: `window.__smReactDOM = React.createPortal ? React : null` —
+  `createPortal` lives on **react-dom**, not on the react core object, so that expression
+  was *always* `null`. `ConfirmDialog` therefore always took its inline fallback branch
+  and rendered as an ordinary child inside the sidebar slot subtree, where an ancestor's
+  `overflow: hidden` / stacking context clipped it away: present in the accessibility
+  tree (which UIA judges geometrically) but zero pixels on screen. Fix: resolve the real
+  `createPortal` from `react-dom` at module scope into `window.__smCreatePortal`
+  (`window.__smReactDOM` now holds the react-dom module, not the react core), and route
+  all three dialog layers — `ConfirmDialog`, `MoveDialog`, `MigratePresetDialog` — through
+  the new `smPortalInto(tree, createPortal)` helper. `MoveDialog` and
+  `MigratePresetDialog` had never been portalled at all and were clipped the same way.
+
 ## 0.4.11 — 2026-09-14
 
 - **chore(client)**: drop `@deepseek-ai/dsh-client-runtime` from `dsh.client.inject`. The package is no longer shipped by DSH 0.1.5-rc.2 / 0.1.2-alpha or newer (its client-bootstrap role was folded into `@deepseek-ai/dsh-client-store`). This plugin's bundle never required it, so removing the stale reference is a no-op at runtime and only cleans up the published manifest (#12).

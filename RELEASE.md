@@ -1,6 +1,6 @@
 # RELEASE.md — 发布清单
 
-包名 `dsh-wm-toolkit`（2026-09-18 首发 `0.1.0`），当前版本 `0.2.14`。
+包名 `dsh-wm-toolkit`（2026-09-18 首发 `0.1.0`），当前版本 `0.2.21`。
 
 ## 0. 发布前的验证状态
 
@@ -23,6 +23,32 @@
 3. 若某项异常，先看上面的日志（`半边应用失败（已隔离）` 会带堆栈），再看浏览器控制台。
 
 > 注意：客户端半边改动后需要**刷新页面**（Ctrl+Shift+R）才生效；宿主半边改动需要**重启 DSH**。
+
+> **`0.2.21` 的改动（适配 DSH 0.2.2-rc.1，四条）**：
+> 1. **修好标题栏「删除会话」点了没反应** —— 真因不是删除接口坏了，而是弹层从没画到屏幕上：
+>    `window.__smReactDOM = React.createPortal ? React : null` 恒为 `null`（`createPortal` 在
+>    react-dom 上，不在 react 核心包上），确认框一直走 inline 兜底分支被侧栏 `overflow:hidden`
+>    裁掉 —— UIA 无障碍树按几何判定可见，所以「树里有、屏上 0 像素」。
+>    现在模块顶部从 `react-dom` 取真正的 `createPortal` 存进 `window.__smCreatePortal`，
+>    **`ConfirmDialog` / `MoveDialog` / `MigratePresetDialog` 三个弹层统一 portal 到 body**。
+>    验收：点标题栏红字按钮 → 确认框应出现在按钮下方（修复前屏幕上一个像素都没有）。
+> 2. **「迁移工作区」搬进工作区行右键菜单** —— 0.2.2-rc.1 开了
+>    `@deepseek-ai/dsh-client-ui-context-menu`，插件注册
+>    `{ id: "session-manager.migrate-workspace", target: "workspace", order: 200 }`，
+>    正好夹在官方「重命名」(100) 与「删除工作区」(300) 之间；老宿主取不到
+>    `ctx.get("contextMenus")` 时仍回落到左侧栏「更多」菜单。`dsh.client.inject` 因此新增
+>    `@deepseek-ai/dsh-client-ui-context-menu`，`engines.dsh` 补 `|| ^0.2.2-rc.1`。
+>    验收：右键侧栏任一会话工作区 → 菜单里「重命名 / 迁移工作区… / 删除工作区」三段顺序正确。
+> 3. **修 `ConfirmDialog` 一处必然抛 TDZ 的死代码** —— `if (!body) return tree || null;`
+>    写在 `const tree` 之前，`document.body` 不在的时序会 `ReferenceError` 并拖崩整个 slot。
+> 4. **删除失败不再静默** —— `runWithAlert` 的 catch 里先 `reportClientError()`
+>    （`console.error` + 复用已有的 `POST /bubble/log` 通道，落到
+>    `$DSH_HOME/dsh-message-recall-wm.log`），再显示那个 8 秒即消失的气泡。
+>
+> 验证读数：`node build.mjs` → `lib/client.js` 363,130 字节 / 3 个半边；
+> `node --check lib/client.js` exit 0；`node tests/run-all.mjs` → **24/24 套通过**；
+> 真机端到端删掉一个临时新建的会话（工件目录 + projcache json 双双消失），
+> 全程用截图确认确认框真的画出来了。
 
 > **`0.2.14` 修的两处（都带回归测试；图片那处只动客户端半边，日志上限动宿主半边）**：
 > 1. **rc.3 起带图片附件的用户消息不显示图片** —— rc.3 不再注入 `renderMessageImages`
